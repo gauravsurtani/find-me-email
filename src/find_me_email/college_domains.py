@@ -10,6 +10,9 @@ from __future__ import annotations
 import re
 
 # Curated map for top schools likely to appear in the dataset (extend freely).
+# Values are the *primary* student-email domain. Schools with multiple subdomains
+# (CMU has andrew.cmu.edu + tepper.cmu.edu, Yale has yale.edu + aya.yale.edu)
+# are handled by additional_domains_for() below.
 KNOWN: dict[str, str] = {
     "stanford university": "stanford.edu",
     "stanford": "stanford.edu",
@@ -34,10 +37,13 @@ KNOWN: dict[str, str] = {
     "cornell university": "cornell.edu",
     "university of washington": "uw.edu",
     "university of michigan": "umich.edu",
+    "umich": "umich.edu",
+    "university of michigan ann arbor": "umich.edu",
     "georgia tech": "gatech.edu",
     "georgia institute of technology": "gatech.edu",
     "university of illinois urbana champaign": "illinois.edu",
     "uiuc": "illinois.edu",
+    "university of illinois at urbana champaign": "illinois.edu",
     "university of texas at austin": "utexas.edu",
     "ut austin": "utexas.edu",
     "new york university": "nyu.edu",
@@ -56,7 +62,68 @@ KNOWN: dict[str, str] = {
     "ucsc": "ucsc.edu",
     "university of california irvine": "uci.edu",
     "uc irvine": "uci.edu",
+    "university of california riverside": "ucr.edu",
+    "uc riverside": "ucr.edu",
+    "ucr": "ucr.edu",
+    # New additions from canary failures + common US schools
+    "north carolina state university": "ncsu.edu",
+    "nc state": "ncsu.edu",
+    "ncsu": "ncsu.edu",
+    "new mexico state university": "nmsu.edu",
+    "nmsu": "nmsu.edu",
+    "virginia tech": "vt.edu",
+    "virginia polytechnic institute": "vt.edu",
+    "vt": "vt.edu",
+    "clemson university": "g.clemson.edu",
+    "clemson": "g.clemson.edu",
+    "texas a&m university": "tamu.edu",
+    "texas a&m": "tamu.edu",
+    "tamu": "tamu.edu",
+    "arizona state university": "asu.edu",
+    "asu": "asu.edu",
+    "university of chicago": "uchicago.edu",
+    "uchicago": "uchicago.edu",
+    "chicago booth": "chicagobooth.edu",
+    "booth school of business": "chicagobooth.edu",
+    "university of virginia": "virginia.edu",
+    "uva": "virginia.edu",
+    "university at buffalo": "buffalo.edu",
+    "suny buffalo": "buffalo.edu",
+    "university of california san francisco": "ucsf.edu",
+    "ucsf": "ucsf.edu",
+    "university of san francisco": "usfca.edu",
+    "san francisco state university": "sfsu.edu",
+    "sfsu": "sfsu.edu",
+    # International / scholar-friendly catch-alls
+    "oxford university": "ox.ac.uk",
+    "university of oxford": "ox.ac.uk",
+    "cambridge university": "cam.ac.uk",
+    "university of cambridge": "cam.ac.uk",
 }
+
+
+# Schools that commonly use multiple email subdomains for different programs.
+# Pattern guesser will generate candidates against ALL listed domains for the school.
+SUBDOMAIN_VARIANTS: dict[str, list[str]] = {
+    "stanford.edu": ["stanford.edu", "cs.stanford.edu", "alumni.stanford.edu"],
+    "berkeley.edu": ["berkeley.edu", "mba.berkeley.edu"],
+    "andrew.cmu.edu": ["andrew.cmu.edu", "cmu.edu", "tepper.cmu.edu", "cs.cmu.edu"],
+    "yale.edu": ["yale.edu", "aya.yale.edu"],
+    "mit.edu": ["mit.edu", "alum.mit.edu", "sloan.mit.edu"],
+    "harvard.edu": ["harvard.edu", "college.harvard.edu", "g.harvard.edu", "hbs.edu"],
+    "columbia.edu": ["columbia.edu", "gsb.columbia.edu"],
+    "northeastern.edu": ["northeastern.edu", "husky.neu.edu"],
+}
+
+
+def domains_for(school: str | None) -> list[str]:
+    """Return ALL email-domain candidates for a school (primary + known subdomains)."""
+    primary = resolve_domain(school)
+    if not primary:
+        return []
+    variants = SUBDOMAIN_VARIANTS.get(primary, [primary])
+    # Always include the primary first
+    return [primary] + [v for v in variants if v != primary]
 
 STOPWORDS = {"university", "of", "the", "college", "institute", "school", "and"}
 LINKEDIN_SCHOOL_RE = re.compile(r"linkedin\.com/school/([^/?#]+)")
