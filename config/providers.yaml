@@ -4,13 +4,13 @@ cascade:
   - name: apify_b2b_leads
     enabled: true
     actor_id: b2b_leads/linkedin-profile-scraper
-    timeout_s: 600
+    timeout_s: 1800
     notes: Pay-per-result LinkedIn email finder. Cheapest first pass.
 
   - name: apify_harvestapi
     enabled: true
     actor_id: harvestapi/linkedin-profile-scraper
-    timeout_s: 600
+    timeout_s: 1800
     mode: full_with_email
     notes: Higher-quality fallback; SMTP-validated emails.
 

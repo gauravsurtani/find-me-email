@@ -5,9 +5,11 @@ import time
 from typing import Any
 
 import httpx
-from tenacity import retry, stop_after_attempt, wait_exponential
+from rich.console import Console
 
 from find_me_email.settings import settings
+
+console = Console()
 
 APIFY_BASE = "https://api.apify.com/v2"
 
@@ -34,14 +36,19 @@ class ApifyClient:
     async def __aexit__(self, *_):
         await self.aclose()
 
-    @retry(stop=stop_after_attempt(3), wait=wait_exponential(min=2, max=20))
     async def run_actor_sync(
         self,
         actor_id: str,
         input_payload: dict[str, Any],
-        wait_secs: int = 600,
+        wait_secs: int = 1800,
+        progress_every_s: int = 30,
     ) -> list[dict[str, Any]]:
-        """Run an actor and return its dataset items. Blocks until done or timeout."""
+        """Run an actor and return its dataset items.
+
+        Intentionally NOT wrapped in retry — retrying the whole flow on a poll
+        timeout would spawn a duplicate actor run (= duplicate billing). Caller
+        should retry only on transient errors during start.
+        """
         actor_path = actor_id.replace("/", "~")
         start_url = f"{APIFY_BASE}/acts/{actor_path}/runs"
         params = {"token": self.token}
@@ -51,20 +58,38 @@ class ApifyClient:
         run = r.json()["data"]
         run_id = run["id"]
         dataset_id = run["defaultDatasetId"]
+        console.print(f"  [dim]apify run started: {run_id} (waiting up to {wait_secs}s)[/dim]")
 
         deadline = time.time() + wait_secs
         status_url = f"{APIFY_BASE}/actor-runs/{run_id}"
+        last_progress = time.time()
+        last_status = ""
         while time.time() < deadline:
             await asyncio.sleep(5)
             sr = await self._client.get(status_url, params=params)
             sr.raise_for_status()
-            status = sr.json()["data"]["status"]
+            data = sr.json()["data"]
+            status = data["status"]
+            if status != last_status or (time.time() - last_progress) >= progress_every_s:
+                elapsed = int(time.time() - (deadline - wait_secs))
+                stats = data.get("stats", {})
+                console.print(
+                    f"  [dim]…{run_id[:8]}: {status} "
+                    f"(elapsed {elapsed}s, runtime {stats.get('runTimeSecs', 0)}s)[/dim]"
+                )
+                last_status = status
+                last_progress = time.time()
             if status == "SUCCEEDED":
                 break
             if status in ("FAILED", "ABORTED", "TIMED-OUT"):
                 raise ApifyError(f"Actor {actor_id} {status}")
         else:
-            raise ApifyError(f"Actor {actor_id} did not finish in {wait_secs}s")
+            # Don't leave the run orphaned — abort it so we don't keep getting billed.
+            try:
+                await self._client.post(f"{APIFY_BASE}/actor-runs/{run_id}/abort", params=params)
+            except Exception:
+                pass
+            raise ApifyError(f"Actor {actor_id} did not finish in {wait_secs}s (run {run_id} aborted)")
 
         items_url = f"{APIFY_BASE}/datasets/{dataset_id}/items"
         ir = await self._client.get(items_url, params={**params, "clean": "true"})
