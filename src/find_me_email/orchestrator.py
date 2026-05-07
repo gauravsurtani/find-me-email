@@ -112,8 +112,11 @@ class Orchestrator:
                     result.total_cost_usd + sum(c.cost_usd for c in cands), 6
                 )
 
+                # Only short-circuit on a strong signal: HIGH confidence AND verified.
+                # An unverified DB match (often a work email) shouldn't block the
+                # pattern guesser from also producing a school-domain candidate.
                 hit_high = any(
-                    c.confidence in (Confidence.HIGH, Confidence.MEDIUM) for c in cands
+                    c.confidence == Confidence.HIGH and c.verified for c in cands
                 )
                 if hit_high:
                     provider_stats[provider.name]["hits"] += 1

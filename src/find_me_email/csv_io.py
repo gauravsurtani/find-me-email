@@ -88,10 +88,11 @@ def read_people(path: Path, sample: int | None = None, seed: int = 42) -> list[P
     if "linkedin_url" in cmap:
         df = df[df[cmap["linkedin_url"]].notna() & (df[cmap["linkedin_url"]] != "")]
 
+    # Reset before sampling so the index reflects original CSV row order;
+    # KEEP the index after sampling so row_ids align with read_truth's keys.
+    df = df.reset_index(drop=True)
     if sample and len(df) > sample:
-        df = df.sample(n=sample, random_state=seed).reset_index(drop=True)
-    else:
-        df = df.reset_index(drop=True)
+        df = df.sample(n=sample, random_state=seed)
 
     people: list[Person] = []
     for idx, row in df.iterrows():
