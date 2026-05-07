@@ -14,6 +14,20 @@ cascade:
     mode: full_with_email
     notes: Higher-quality fallback; SMTP-validated emails.
 
+  - name: apify_school_serp
+    enabled: true
+    actor_id: apify/google-search-scraper
+    timeout_s: 1200
+    results_per_query: 10
+    max_domains_per_person: 2
+    fetch_top_pages: 3
+    fetch_timeout_s: 8.0
+    notes: |
+      Google search restricted to the school's .edu domain. Forces results
+      to come from the school's own subdomains where directories, department
+      pages, and lab sites live — avoids the wrong-person hits Exa returns
+      when the same name exists elsewhere on the web.
+
   - name: exa
     enabled: true
     num_results: 5
