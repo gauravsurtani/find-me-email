@@ -14,6 +14,13 @@ cascade:
     mode: full_with_email
     notes: Higher-quality fallback; SMTP-validated emails.
 
+  - name: exa
+    enabled: true
+    num_results: 5
+    use_contents: true
+    timeout_s: 30
+    notes: Neural web search for emails on personal sites, papers, lab pages, GitHub.
+
   - name: college_pattern_guess
     enabled: true
     require_school_or_domain: true
