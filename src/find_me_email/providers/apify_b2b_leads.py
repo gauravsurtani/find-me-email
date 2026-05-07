@@ -1,13 +1,10 @@
 from __future__ import annotations
 
-import re
 from typing import Any
 
 from find_me_email.apify_client import ApifyClient
 from find_me_email.providers.base import EnrichmentProvider
 from find_me_email.schemas import Confidence, EmailCandidate, Person
-
-EMAIL_RE = re.compile(r"[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}")
 
 
 class ApifyB2BLeadsProvider(EnrichmentProvider):

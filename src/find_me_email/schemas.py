@@ -13,6 +13,18 @@ class Confidence(str, Enum):
     LOW = "low"            # Pattern guess, SMTP-verified
     SPECULATIVE = "speculative"  # Pattern guess, unverified — DO NOT send without checking
 
+    @property
+    def rank(self) -> int:
+        return _CONFIDENCE_RANK[self]
+
+
+_CONFIDENCE_RANK = {
+    Confidence.HIGH: 0,
+    Confidence.MEDIUM: 1,
+    Confidence.LOW: 2,
+    Confidence.SPECULATIVE: 3,
+}
+
 
 class Person(BaseModel):
     """Generic person input. Only `row_id` is required; everything else is optional context."""
@@ -51,5 +63,22 @@ class EnrichmentResult(BaseModel):
     def best(self) -> EmailCandidate | None:
         if not self.candidates:
             return None
-        order = {Confidence.HIGH: 0, Confidence.MEDIUM: 1, Confidence.LOW: 2, Confidence.SPECULATIVE: 3}
-        return sorted(self.candidates, key=lambda c: order[c.confidence])[0]
+        return min(self.candidates, key=lambda c: c.confidence.rank)
+
+    @property
+    def is_strong(self) -> bool:
+        """HIGH confidence AND verified — earns short-circuit through the cascade."""
+        return any(
+            c.confidence == Confidence.HIGH and c.verified for c in self.candidates
+        )
+
+    @property
+    def has_any(self) -> bool:
+        return any(c.email for c in self.candidates)
+
+    @property
+    def has_medium_or_better(self) -> bool:
+        return any(
+            c.email and c.confidence.rank <= Confidence.MEDIUM.rank
+            for c in self.candidates
+        )

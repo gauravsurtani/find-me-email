@@ -15,17 +15,21 @@ conference pages, lab pages, GitHub READMEs, etc.
 """
 from __future__ import annotations
 
-import re
 from typing import Any
 
 import httpx
 
+from find_me_email.providers._emailmatch import (
+    EMAIL_RE,
+    match_flags,
+    normalize_email,
+    person_tokens,
+)
 from find_me_email.providers.base import EnrichmentProvider
 from find_me_email.schemas import Confidence, EmailCandidate, Person
 from find_me_email.settings import settings
 
 EXA_API = "https://api.exa.ai/search"
-EMAIL_RE = re.compile(r"[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}")
 
 
 class ExaProvider(EnrichmentProvider):
@@ -91,7 +95,7 @@ class ExaProvider(EnrichmentProvider):
     ) -> list[EmailCandidate]:
         out: list[EmailCandidate] = []
         seen: set[str] = set()
-        person_tokens = self._person_tokens(person)
+        tokens = person_tokens(person)
         target_domain = (person.school_domain or "").lower()
 
         for r in results:
@@ -103,11 +107,11 @@ class ExaProvider(EnrichmentProvider):
             ]
             for blob in text_blobs:
                 for match in EMAIL_RE.findall(blob):
-                    email = match.lower().strip(".,;:")
+                    email = normalize_email(match)
                     if email in seen:
                         continue
                     seen.add(email)
-                    confidence, notes = self._score(email, person_tokens, target_domain)
+                    confidence, notes = self._score(email, tokens, target_domain)
                     out.append(
                         EmailCandidate(
                             email=email,
@@ -122,22 +126,8 @@ class ExaProvider(EnrichmentProvider):
         return out
 
     @staticmethod
-    def _person_tokens(person: Person) -> set[str]:
-        tokens: set[str] = set()
-        for s in (person.name, person.first_name, person.last_name):
-            if not s:
-                continue
-            for t in re.split(r"[^a-z]+", s.lower()):
-                if len(t) >= 3:
-                    tokens.add(t)
-        return tokens
-
-    @staticmethod
-    def _score(email: str, person_tokens: set[str], target_domain: str) -> tuple[Confidence, str]:
-        local, _, dom = email.partition("@")
-        local_lower = local.lower()
-        token_match = any(tok in local_lower for tok in person_tokens) if person_tokens else False
-        domain_match = bool(target_domain) and dom.endswith(target_domain)
+    def _score(email: str, tokens: set[str], target_domain: str) -> tuple[Confidence, str]:
+        token_match, domain_match = match_flags(email, tokens, target_domain)
         if token_match and domain_match:
             return Confidence.MEDIUM, "Exa: name+school both present in result"
         if domain_match:

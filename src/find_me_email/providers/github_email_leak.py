@@ -1,32 +1,16 @@
 """GitHub commit-author email harvester.
 
-Strategy:
-1. Find a candidate GitHub username for the person:
-   a. From `person.extra` if a `github` URL was supplied in the input CSV
-   b. From the GitHub user-search API (`q="<name>"`)
-2. For each plausible username (max 3, ranked by name match):
-   a. Fetch `/users/<username>` to grab public profile email if exposed
-   b. Fetch `/users/<username>/events/public` for recent push events; pull
-      author + committer emails out of each commit object
-   c. Fetch top N public repos and scan recent commits for emails too
-3. Filter:
-   - GitHub's `<id>+<user>@users.noreply.github.com` mask → drop
-   - Generic addresses (webmaster@, info@, etc.) → drop
-   - Anything not containing a name token → mark SPECULATIVE only
-4. Score:
-   - Profile-page email + name match: HIGH (verified by user)
-   - Commit author email + name match + matches school domain: MEDIUM
-   - Commit author email + name match: LOW
-   - Commit author email + no name match: SPECULATIVE
+Most CLI-pushed Git commits embed `git config user.email` in the commit
+object forever. This provider:
+  1. Searches GitHub for usernames matching the person's name
+  2. Pulls public profile email + recent commit-author emails (events feed
+     + recent repos)
+  3. Filters GitHub's `<id>+<user>@users.noreply.github.com` mask + role
+     accounts
+  4. Scores by name-token + school-domain match
 
-Why this works: most GitHub users (especially pre-2020 accounts) push from a
-shell where `git config user.email` was set during initial install — exposing
-their real mail forever in commit history. GitHub introduced the `noreply`
-mask for the web UI default in 2017, but CLI-pushed commits still leak unless
-the user explicitly switched. Industry research suggests ~40-70% leak rate.
-
-Free, no auth required for low volume (60 req/hr); set GITHUB_TOKEN env var
-for 5000 req/hr.
+Free + no auth required for low volume (60 req/hr); set GITHUB_TOKEN for
+5000 req/hr.
 """
 from __future__ import annotations
 
@@ -35,30 +19,32 @@ import re
 from typing import Any
 
 import httpx
+from rich.console import Console
 
+from find_me_email.providers._emailmatch import (
+    EMAIL_FULLMATCH_RE,
+    ROLE_LOCAL_PARTS,
+    match_flags,
+    merge_candidate,
+    person_tokens,
+)
 from find_me_email.providers.base import EnrichmentProvider
 from find_me_email.schemas import Confidence, EmailCandidate, Person
-from find_me_email.settings import settings
 
 GITHUB_API = "https://api.github.com"
 NOREPLY_RE = re.compile(r"^\d*\+?[A-Za-z0-9_-]+@users\.noreply\.github\.com$", re.I)
-EMAIL_RE = re.compile(r"^[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}$")
-ROLE_LOCAL_PARTS = {
-    "noreply",
-    "no-reply",
-    "webmaster",
-    "info",
-    "contact",
-    "support",
-    "admin",
-    "help",
-    "hello",
+GITHUB_URL_RE = re.compile(r"github\.com/([A-Za-z0-9-]{1,39})", re.I)
+
+# CI/bot accounts in addition to the standard role-accounts.
+GITHUB_ROLE_LOCAL_PARTS = ROLE_LOCAL_PARTS | {
     "ci",
     "build",
     "actions",
     "github-actions[bot]",
+    "dependabot[bot]",
 }
-GITHUB_URL_RE = re.compile(r"github\.com/([A-Za-z0-9-]{1,39})", re.I)
+
+console = Console()
 
 
 class GithubEmailLeakProvider(EnrichmentProvider):
@@ -67,12 +53,13 @@ class GithubEmailLeakProvider(EnrichmentProvider):
 
     def __init__(self, config: dict | None = None):
         super().__init__(config)
-        self.token: str = self.config.get("token") or settings.github_token
+        from find_me_email.settings import settings as _settings
+
+        self.token: str = self.config.get("token") or _settings.github_token
         self.timeout_s: float = float(self.config.get("timeout_s", 20.0))
         self.max_username_candidates: int = int(self.config.get("max_username_candidates", 3))
         self.max_repos_to_scan: int = int(self.config.get("max_repos_to_scan", 5))
         self.max_commits_per_repo: int = int(self.config.get("max_commits_per_repo", 30))
-        # GitHub user-search API needs at least a name to be useful.
 
     def can_handle(self, person: Person) -> bool:
         return bool(person.name) or bool(self._extract_github_url(person))
@@ -96,20 +83,7 @@ class GithubEmailLeakProvider(EnrichmentProvider):
 
         sem = asyncio.Semaphore(4)
         async with httpx.AsyncClient(timeout=self.timeout_s, headers=headers) as client:
-            # Quick rate-limit pre-check so we don't burn time on a known-empty quota.
-            try:
-                rl = await client.get(f"{GITHUB_API}/rate_limit")
-                if rl.status_code == 200:
-                    core = rl.json().get("resources", {}).get("core", {})
-                    if core.get("remaining", 0) < len(targets) * 3:
-                        from rich.console import Console
-                        Console().print(
-                            f"[yellow]github_email_leak: only {core.get('remaining', 0)} "
-                            f"API calls left in the hour for ~{len(targets) * 3} needed. "
-                            f"{'Set GITHUB_TOKEN in .env for 5000/hr.' if not self.token else 'Wait for reset at ' + str(core.get('reset', '?'))}[/yellow]"
-                        )
-            except Exception:
-                pass
+            await self._warn_if_quota_low(client, len(targets))
 
             async def _one(person: Person) -> None:
                 async with sem:
@@ -121,6 +95,28 @@ class GithubEmailLeakProvider(EnrichmentProvider):
             await asyncio.gather(*(_one(p) for p in targets), return_exceptions=True)
         return out
 
+    async def _warn_if_quota_low(self, client: httpx.AsyncClient, n_targets: int) -> None:
+        # ~3 API calls per target (search + profile + events); rough overestimate.
+        try:
+            rl = await client.get(f"{GITHUB_API}/rate_limit")
+        except Exception:
+            return
+        if rl.status_code != 200:
+            return
+        core = rl.json().get("resources", {}).get("core", {})
+        remaining = core.get("remaining", 0)
+        if remaining >= n_targets * 3:
+            return
+        suffix = (
+            "Set GITHUB_TOKEN in .env for 5000/hr."
+            if not self.token
+            else f"Wait for reset at {core.get('reset', '?')}"
+        )
+        console.print(
+            f"[yellow]github_email_leak: only {remaining} API calls left "
+            f"in the hour for ~{n_targets * 3} needed. {suffix}[/yellow]"
+        )
+
     # ---------------------------------------------------------------- pipeline
 
     async def _enrich_one(
@@ -131,96 +127,112 @@ class GithubEmailLeakProvider(EnrichmentProvider):
             return []
 
         results: dict[str, EmailCandidate] = {}
-        person_tokens = self._person_tokens(person)
+        tokens = person_tokens(person)
         target_domain = (person.school_domain or "").lower()
 
         for username in usernames[: self.max_username_candidates]:
-            # 1. Profile page — has public email if the user opted to expose it.
-            try:
-                r = await client.get(f"{GITHUB_API}/users/{username}")
-                if r.status_code == 200:
-                    profile = r.json()
-                    public_email = (profile.get("email") or "").strip().lower()
-                    if public_email and self._is_usable_email(public_email):
-                        self._merge(
+            await self._harvest_username(
+                client, username, results, tokens, target_domain
+            )
+        return list(results.values())
+
+    async def _harvest_username(
+        self,
+        client: httpx.AsyncClient,
+        username: str,
+        results: dict[str, EmailCandidate],
+        tokens: set[str],
+        target_domain: str,
+    ) -> None:
+        # Three independent endpoints; fan out concurrently.
+        profile_t = asyncio.create_task(
+            client.get(f"{GITHUB_API}/users/{username}")
+        )
+        events_t = asyncio.create_task(
+            client.get(
+                f"{GITHUB_API}/users/{username}/events/public",
+                params={"per_page": 100},
+            )
+        )
+        repos_t = asyncio.create_task(
+            client.get(
+                f"{GITHUB_API}/users/{username}/repos",
+                params={"per_page": self.max_repos_to_scan, "sort": "pushed"},
+            )
+        )
+        profile_r, events_r, repos_r = await asyncio.gather(
+            profile_t, events_t, repos_t, return_exceptions=True
+        )
+
+        # Profile: public email if user opted to expose it.
+        if isinstance(profile_r, httpx.Response) and profile_r.status_code == 200:
+            email = (profile_r.json().get("email") or "").strip().lower()
+            if email and self._is_usable(email):
+                self._record(
+                    results,
+                    email,
+                    tokens,
+                    target_domain,
+                    source=f"https://github.com/{username}",
+                    origin="profile",
+                )
+
+        # Events feed: PushEvents have full commit objects with author email.
+        if isinstance(events_r, httpx.Response) and events_r.status_code == 200:
+            for event in events_r.json():
+                if event.get("type") != "PushEvent":
+                    continue
+                for commit in (event.get("payload") or {}).get("commits") or []:
+                    email = ((commit.get("author") or {}).get("email") or "").strip().lower()
+                    if email and self._is_usable(email):
+                        self._record(
                             results,
-                            public_email,
-                            person_tokens,
+                            email,
+                            tokens,
                             target_domain,
                             source=f"https://github.com/{username}",
-                            origin="profile",
+                            origin="events",
                         )
-            except httpx.HTTPError:
-                continue
 
-            # 2. Recent public events — push events have full commit objects with email.
-            try:
-                r = await client.get(
-                    f"{GITHUB_API}/users/{username}/events/public",
-                    params={"per_page": 100},
-                )
-                if r.status_code == 200:
-                    for event in r.json():
-                        if event.get("type") != "PushEvent":
-                            continue
-                        for commit in (event.get("payload") or {}).get("commits") or []:
-                            author = commit.get("author") or {}
-                            email = (author.get("email") or "").strip().lower()
-                            if email and self._is_usable_email(email):
-                                self._merge(
-                                    results,
-                                    email,
-                                    person_tokens,
-                                    target_domain,
-                                    source=f"https://github.com/{username}",
-                                    origin="events",
-                                )
-            except httpx.HTTPError:
-                pass
-
-            # 3. Repo-level commit history — useful for older accounts whose
-            #    activity is no longer in the events feed (events are 90-day TTL).
-            try:
-                r = await client.get(
-                    f"{GITHUB_API}/users/{username}/repos",
-                    params={"per_page": self.max_repos_to_scan, "sort": "pushed"},
-                )
-                if r.status_code != 200:
-                    continue
-                for repo in r.json():
-                    full = repo.get("full_name")
-                    if not full:
-                        continue
-                    cr = await client.get(
+        # Repo commit history: covers older accounts whose events have rolled off
+        # (events feed has a 90-day TTL).
+        if isinstance(repos_r, httpx.Response) and repos_r.status_code == 200:
+            repo_full_names = [
+                r.get("full_name") for r in repos_r.json() if r.get("full_name")
+            ]
+            commit_responses = await asyncio.gather(
+                *(
+                    client.get(
                         f"{GITHUB_API}/repos/{full}/commits",
                         params={"per_page": self.max_commits_per_repo},
                     )
-                    if cr.status_code != 200:
-                        continue
-                    for commit in cr.json():
-                        for who in ("author", "committer"):
-                            cobj = (commit.get("commit") or {}).get(who) or {}
-                            email = (cobj.get("email") or "").strip().lower()
-                            if email and self._is_usable_email(email):
-                                self._merge(
-                                    results,
-                                    email,
-                                    person_tokens,
-                                    target_domain,
-                                    source=f"https://github.com/{full}",
-                                    origin="repo_commits",
-                                )
-            except httpx.HTTPError:
-                pass
-
-        return list(results.values())
+                    for full in repo_full_names
+                ),
+                return_exceptions=True,
+            )
+            for full, cr in zip(repo_full_names, commit_responses):
+                if not isinstance(cr, httpx.Response) or cr.status_code != 200:
+                    continue
+                for commit in cr.json():
+                    for who in ("author", "committer"):
+                        email = (
+                            (commit.get("commit") or {}).get(who) or {}
+                        ).get("email", "").strip().lower()
+                        if email and self._is_usable(email):
+                            self._record(
+                                results,
+                                email,
+                                tokens,
+                                target_domain,
+                                source=f"https://github.com/{full}",
+                                origin="repo_commits",
+                            )
 
     # ------------------------------------------------------ username discovery
 
     async def _discover_usernames(
         self, client: httpx.AsyncClient, person: Person
     ) -> list[str]:
-        # Direct hint in the source CSV (e.g., a `github` column).
         explicit = self._extract_github_url(person)
         if explicit:
             return [explicit]
@@ -228,38 +240,31 @@ class GithubEmailLeakProvider(EnrichmentProvider):
         if not person.name:
             return []
 
-        # GitHub user search. Bare-name-only first — bonus filters (school,
-        # location) get AND-combined and zero out results too aggressively.
-        # If we get many candidates, our username-overlap score handles
-        # disambiguation downstream.
-        q = f'"{person.name}" in:fullname'
+        # Bare-name-only search; bonus filters AND-combine and zero out results.
         try:
             r = await client.get(
                 f"{GITHUB_API}/search/users",
-                params={"q": q, "per_page": 10},
+                params={"q": f'"{person.name}" in:fullname', "per_page": 10},
             )
-            if r.status_code != 200:
-                return []
-            items = r.json().get("items") or []
         except httpx.HTTPError:
             return []
+        if r.status_code != 200:
+            return []
 
-        # Return logins ranked by name-similarity; GitHub already orders by
-        # relevance but verify name overlap to avoid completely-wrong matches.
+        tokens = person_tokens(person)
         ranked: list[tuple[int, str]] = []
-        person_tokens = self._person_tokens(person)
-        for item in items:
+        for item in r.json().get("items") or []:
             login = (item.get("login") or "").strip()
             if not login:
                 continue
-            score = self._username_score(login, person_tokens)
-            ranked.append((score, login))
+            score = sum(1 for tok in tokens if tok in login.lower())
+            if score > 0:
+                ranked.append((score, login))
         ranked.sort(key=lambda x: -x[0])
-        return [login for score, login in ranked if score > 0]
+        return [login for _, login in ranked]
 
     @staticmethod
     def _extract_github_url(person: Person) -> str | None:
-        # Look in person.extra for any field that mentions github.com
         for v in (person.extra or {}).values():
             if isinstance(v, str):
                 m = GITHUB_URL_RE.search(v)
@@ -267,81 +272,41 @@ class GithubEmailLeakProvider(EnrichmentProvider):
                     return m.group(1)
         return None
 
-    @staticmethod
-    def _person_tokens(person: Person) -> set[str]:
-        tokens: set[str] = set()
-        for s in (person.name, person.first_name, person.last_name):
-            if not s:
-                continue
-            for t in re.split(r"[^a-z]+", s.lower()):
-                if len(t) >= 3:
-                    tokens.add(t)
-        return tokens
-
-    @staticmethod
-    def _username_score(login: str, person_tokens: set[str]) -> int:
-        if not person_tokens:
-            return 0
-        login_lower = login.lower()
-        return sum(1 for tok in person_tokens if tok in login_lower)
-
     # ---------------------------------------------------------- email handling
 
     @staticmethod
-    def _is_usable_email(email: str) -> bool:
-        if not email or "@" not in email:
-            return False
-        if not EMAIL_RE.match(email):
+    def _is_usable(email: str) -> bool:
+        if not EMAIL_FULLMATCH_RE.match(email):
             return False
         if NOREPLY_RE.match(email):
             return False
         local = email.split("@", 1)[0].lower()
-        if local in ROLE_LOCAL_PARTS:
-            return False
-        return True
+        return local not in GITHUB_ROLE_LOCAL_PARTS
 
-    def _merge(
+    def _record(
         self,
-        bag: dict[str, EmailCandidate],
+        results: dict[str, EmailCandidate],
         email: str,
-        person_tokens: set[str],
+        tokens: set[str],
         target_domain: str,
         source: str,
         origin: str,
     ) -> None:
-        confidence, note = self._score(email, person_tokens, target_domain, origin)
-        existing = bag.get(email)
-        if existing is None:
-            bag[email] = EmailCandidate(
-                email=email,
-                confidence=confidence,
-                source_provider=self.name,
-                verified=False,
-                notes=note,
-                cost_usd=0.0,
-                raw={"source": source, "origin": origin},
-            )
-            return
-        order = {
-            Confidence.HIGH: 0,
-            Confidence.MEDIUM: 1,
-            Confidence.LOW: 2,
-            Confidence.SPECULATIVE: 3,
-        }
-        if order[confidence] < order[existing.confidence]:
-            existing.confidence = confidence
-            existing.notes = note
+        confidence, note = self._score(email, tokens, target_domain, origin)
+        merge_candidate(
+            results,
+            email=email,
+            confidence=confidence,
+            notes=note,
+            source_provider=self.name,
+            raw={"source": source, "origin": origin},
+        )
 
     @staticmethod
     def _score(
-        email: str, person_tokens: set[str], target_domain: str, origin: str
+        email: str, tokens: set[str], target_domain: str, origin: str
     ) -> tuple[Confidence, str]:
-        local, _, dom = email.partition("@")
-        local_lower = local.lower()
-        token_match = (
-            any(tok in local_lower for tok in person_tokens) if person_tokens else False
-        )
-        domain_match = bool(target_domain) and dom.endswith(target_domain.lstrip("."))
+        token_match, domain_match = match_flags(email, tokens, target_domain)
 
         if origin == "profile":
             # User explicitly set this as their public profile email.
@@ -351,7 +316,6 @@ class GithubEmailLeakProvider(EnrichmentProvider):
                     "github: public profile email (user-set, name/domain match)",
                 )
             return Confidence.LOW, "github: public profile email (user-set)"
-        # Commit-history sources (events / repo_commits)
         if token_match and domain_match:
             return (
                 Confidence.MEDIUM,
@@ -360,7 +324,10 @@ class GithubEmailLeakProvider(EnrichmentProvider):
         if token_match:
             return Confidence.LOW, f"github: commit author email matches name ({origin})"
         if domain_match:
-            return Confidence.LOW, f"github: commit author email matches school domain ({origin})"
+            return (
+                Confidence.LOW,
+                f"github: commit author email matches school domain ({origin})",
+            )
         return (
             Confidence.SPECULATIVE,
             f"github: commit author email; no name/domain match ({origin})",

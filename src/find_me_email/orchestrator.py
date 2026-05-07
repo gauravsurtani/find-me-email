@@ -1,18 +1,8 @@
-"""Cascade orchestrator. Runs providers in configured order with budget + resumability.
+"""Cascade orchestrator with budget guard, per-row caching, and multi-pass support.
 
-Supports two top-level config shapes:
-
-1. Legacy `cascade:` — flat list of providers, tried in order per person until
-   one returns a HIGH+verified hit. (Still works; existing tests use this.)
-
-2. `passes:` — ordered list of {name, providers}. Each pass runs as a mini-
-   cascade on the rows that aren't yet HIGH+verified. After every pass we
-   write a checkpoint CSV so the user can see exactly what each strategy
-   contributed.
-
-Use `passes:` when you want the "keep trying at each pass with a different
-strategy" workflow — e.g., LinkedIn → school directory → web search → pattern
-guess → SMTP verify.
+Two YAML shapes are supported. `cascade:` is a flat provider list (one pass).
+`passes:` is an ordered list of named mini-cascades, run sequentially on rows
+that aren't yet HIGH+verified, with a CSV checkpoint after each pass.
 """
 from __future__ import annotations
 
@@ -27,7 +17,7 @@ from rich.table import Table
 
 from find_me_email.providers import build_provider
 from find_me_email.providers.base import EnrichmentProvider
-from find_me_email.schemas import Confidence, EmailCandidate, EnrichmentResult, Person
+from find_me_email.schemas import EmailCandidate, EnrichmentResult, Person
 from find_me_email.settings import settings
 from find_me_email.verifier import build_verifier
 
@@ -38,20 +28,6 @@ class BudgetExceeded(RuntimeError):
     pass
 
 
-def _is_strong_hit(cands: list[EmailCandidate]) -> bool:
-    """Strong = HIGH confidence AND verified. Earns short-circuit through the cascade."""
-    return any(c.confidence == Confidence.HIGH and c.verified for c in cands)
-
-
-def _has_any_candidate(cands: list[EmailCandidate]) -> bool:
-    return any(c.email for c in cands)
-
-
-def _has_medium_or_better(cands: list[EmailCandidate]) -> bool:
-    order = {Confidence.HIGH: 0, Confidence.MEDIUM: 1, Confidence.LOW: 2, Confidence.SPECULATIVE: 3}
-    return any(order[c.confidence] <= 1 for c in cands if c.email)
-
-
 class Orchestrator:
     def __init__(self, config_path: Path):
         with config_path.open() as f:
@@ -60,37 +36,36 @@ class Orchestrator:
         self.stop_on_overrun: bool = bool(self.cfg.get("budget", {}).get("stop_on_overrun", True))
         self.spent_usd: float = 0.0
 
-        # Detect mode. `passes:` wins over legacy `cascade:` when both present.
         if "passes" in self.cfg and self.cfg["passes"]:
             self.mode = "passes"
             self.passes: list[dict[str, Any]] = self.cfg["passes"]
-            # Flatten provider list for tools that introspect providers
-            # (estimate, benchmark cost table, stats command).
-            flat: list[dict[str, Any]] = []
-            for p in self.passes:
-                for prov in p.get("providers", []):
-                    if prov.get("enabled", True):
-                        flat.append(prov)
-            self.providers: list[EnrichmentProvider] = [
-                build_provider(p["name"], p) for p in flat
-            ]
         else:
             self.mode = "cascade"
             self.passes = []
-            self.providers = [
-                build_provider(p["name"], p)
-                for p in self.cfg.get("cascade", [])
-                if p.get("enabled", True)
+            self._cascade_cfg: list[dict[str, Any]] = [
+                p for p in self.cfg.get("cascade", []) if p.get("enabled", True)
             ]
 
         self.cache_dir = settings.cache_dir
         self.cache_dir.mkdir(parents=True, exist_ok=True)
-        # Per-pass checkpoint writer. CLI sets this when in passes mode so we
-        # can dump a CSV after each pass without coupling the orchestrator to
-        # csv_io's exact API.
+        # CLI sets this to dump a CSV after each pass without coupling the
+        # orchestrator to csv_io.
         self.checkpoint_writer: Callable[[int, str, list[EnrichmentResult]], None] | None = None
-        # Filled in by _run_passes; the CLI reads it to print the table.
         self.coverage_per_pass: list[dict[str, Any]] = []
+
+    @property
+    def providers(self) -> list[EnrichmentProvider]:
+        """Flat list of all enabled providers, used by `estimate` / `benchmark`."""
+        if self.mode == "passes":
+            cfgs = [
+                prov
+                for ps in self.passes
+                for prov in ps.get("providers", [])
+                if prov.get("enabled", True)
+            ]
+        else:
+            cfgs = self._cascade_cfg
+        return [build_provider(p["name"], p) for p in cfgs]
 
     # ---------- per-row result cache (resumable) ----------
 
@@ -100,15 +75,27 @@ class Orchestrator:
 
     def _load_cached(self, person: Person) -> EnrichmentResult | None:
         p = self._cache_path(person.row_id)
-        if p.exists():
-            try:
-                return EnrichmentResult.model_validate_json(p.read_text())
-            except Exception:
-                return None
-        return None
+        if not p.exists():
+            return None
+        try:
+            return EnrichmentResult.model_validate_json(p.read_text())
+        except Exception:
+            return None
 
     def _save_cached(self, result: EnrichmentResult) -> None:
         self._cache_path(result.person.row_id).write_text(result.model_dump_json(indent=2))
+
+    def _hydrate_accumulator(
+        self, people: list[Person], force_refresh: bool
+    ) -> dict[str, EnrichmentResult]:
+        if force_refresh:
+            return {}
+        out: dict[str, EnrichmentResult] = {}
+        for person in people:
+            cached = self._load_cached(person)
+            if cached:
+                out[person.row_id] = cached
+        return out
 
     # ---------- main ----------
 
@@ -118,32 +105,26 @@ class Orchestrator:
         if self.mode == "passes":
             results = await self._run_passes(people, force_refresh=force_refresh)
         else:
-            results = await self._run_cascade_legacy(
-                people, force_refresh=force_refresh
-            )
-        # Optional final verification step.
+            results = await self._run_cascade_legacy(people, force_refresh=force_refresh)
+
         verifier = build_verifier(self.cfg.get("verifier") or {})
         if verifier is not None:
+            unverified_count = sum(
+                1 for r in results for c in r.candidates if c.email and not c.verified
+            )
             results = await verifier.verify(results)
             for r in results:
                 self._save_cached(r)
-            # Append a final coverage row reflecting post-verification state,
-            # so the user can see the value the verifier added.
+            self.spent_usd += verifier.cost_per_call_usd * unverified_count
             verified_count = sum(
-                1
-                for r in results
-                if any(c.verified for c in r.candidates if c.email)
+                1 for r in results if any(c.verified for c in r.candidates if c.email)
             )
             self.coverage_per_pass.append(
                 {
                     "pass": f"verifier ({verifier.name})",
-                    "any_candidate": sum(
-                        1 for r in results if _has_any_candidate(r.candidates)
-                    ),
-                    "medium_or_better": sum(
-                        1 for r in results if _has_medium_or_better(r.candidates)
-                    ),
-                    "strong": verified_count,  # any verified mailbox counts as "strong" now
+                    "any_candidate": sum(1 for r in results if r.has_any),
+                    "medium_or_better": sum(1 for r in results if r.has_medium_or_better),
+                    "strong": verified_count,
                     "total": len(results),
                 }
             )
@@ -154,19 +135,7 @@ class Orchestrator:
     async def _run_passes(
         self, people: list[Person], force_refresh: bool
     ) -> list[EnrichmentResult]:
-        """Run each pass on the rows that aren't yet HIGH+verified.
-
-        Within a pass, providers cascade exactly like the legacy mode. Between
-        passes, we write a checkpoint and decide who needs the next strategy.
-        """
-        accumulator: dict[str, EnrichmentResult] = {}
-        for person in people:
-            if force_refresh:
-                continue
-            cached = self._load_cached(person)
-            if cached:
-                accumulator[person.row_id] = cached
-
+        accumulator = self._hydrate_accumulator(people, force_refresh)
         provider_stats: dict[str, dict[str, int]] = defaultdict(
             lambda: {"attempted": 0, "hits": 0}
         )
@@ -181,12 +150,7 @@ class Orchestrator:
                 continue
             pass_providers = [build_provider(p["name"], p) for p in provider_cfgs]
 
-            pending = [
-                p for p in people
-                if not _is_strong_hit(
-                    accumulator.get(p.row_id, EnrichmentResult(person=p)).candidates
-                )
-            ]
+            pending = [p for p in people if not self._is_strong(accumulator, p)]
             console.print(
                 f"\n[bold cyan]══ Pass {pass_idx + 1}/{len(self.passes)}: "
                 f"{pass_name}[/bold cyan] ({len(pending)} pending, "
@@ -200,18 +164,17 @@ class Orchestrator:
             )
 
             results_now = self._materialize(people, accumulator)
-            row = {
-                "pass": pass_name,
-                "any_candidate": sum(
-                    1 for r in results_now if _has_any_candidate(r.candidates)
-                ),
-                "medium_or_better": sum(
-                    1 for r in results_now if _has_medium_or_better(r.candidates)
-                ),
-                "strong": sum(1 for r in results_now if _is_strong_hit(r.candidates)),
-                "total": len(people),
-            }
-            self.coverage_per_pass.append(row)
+            self.coverage_per_pass.append(
+                {
+                    "pass": pass_name,
+                    "any_candidate": sum(1 for r in results_now if r.has_any),
+                    "medium_or_better": sum(
+                        1 for r in results_now if r.has_medium_or_better
+                    ),
+                    "strong": sum(1 for r in results_now if r.is_strong),
+                    "total": len(people),
+                }
+            )
 
             if self.checkpoint_writer is not None:
                 try:
@@ -223,35 +186,37 @@ class Orchestrator:
         return self._materialize(people, accumulator)
 
     @staticmethod
+    def _is_strong(
+        accumulator: dict[str, EnrichmentResult], person: Person
+    ) -> bool:
+        r = accumulator.get(person.row_id)
+        return r is not None and r.is_strong
+
+    @staticmethod
     def _materialize(
         people: list[Person], accumulator: dict[str, EnrichmentResult]
     ) -> list[EnrichmentResult]:
-        return [accumulator.get(p.row_id, EnrichmentResult(person=p)) for p in people]
+        out: list[EnrichmentResult] = []
+        for p in people:
+            r = accumulator.get(p.row_id)
+            out.append(r if r is not None else EnrichmentResult(person=p))
+        return out
 
     # ---------- legacy single-cascade mode ----------
 
     async def _run_cascade_legacy(
         self, people: list[Person], force_refresh: bool
     ) -> list[EnrichmentResult]:
-        accumulator: dict[str, EnrichmentResult] = {}
-        for person in people:
-            if force_refresh:
-                continue
-            cached = self._load_cached(person)
-            if cached:
-                accumulator[person.row_id] = cached
-
-        pending = [
-            p for p in people
-            if not _is_strong_hit(
-                accumulator.get(p.row_id, EnrichmentResult(person=p)).candidates
-            )
+        accumulator = self._hydrate_accumulator(people, force_refresh)
+        providers = [
+            build_provider(p["name"], p) for p in self._cascade_cfg
         ]
+        pending = [p for p in people if not self._is_strong(accumulator, p)]
 
         provider_stats: dict[str, dict[str, int]] = defaultdict(
             lambda: {"attempted": 0, "hits": 0}
         )
-        await self._run_provider_chain(pending, self.providers, accumulator, provider_stats)
+        await self._run_provider_chain(pending, providers, accumulator, provider_stats)
         self._write_stats(provider_stats)
         return self._materialize(people, accumulator)
 
@@ -264,16 +229,12 @@ class Orchestrator:
         accumulator: dict[str, EnrichmentResult],
         provider_stats: dict[str, dict[str, int]],
     ) -> None:
-        """Cascade `pending_input` through `providers` in order.
-
-        Mutates `accumulator` and `provider_stats` in place. After each
-        provider, rows without a strong hit fall through to the next.
-        """
+        """Cascade `pending_input` through `providers`. Mutates accumulator + stats."""
         if not providers:
             return
 
         pending: dict[str, list[Person]] = {p.name: [] for p in providers}
-        # Skip providers already attempted on this row from a prior run/pass.
+        # Skip providers already attempted for a row from a prior run/pass.
         for person in pending_input:
             existing = accumulator.get(person.row_id)
             attempted = set(existing.providers_attempted) if existing else set()
@@ -318,21 +279,21 @@ class Orchestrator:
 
                 existing = accumulator.get(person.row_id)
                 result = existing or EnrichmentResult(person=person)
+                changed = bool(cands) or provider.name not in result.providers_attempted
                 result.candidates.extend(cands)
                 if provider.name not in result.providers_attempted:
                     result.providers_attempted.append(provider.name)
                 result.total_cost_usd = round(
                     result.total_cost_usd + sum(c.cost_usd for c in cands), 6
                 )
+                accumulator[person.row_id] = result
 
-                if _is_strong_hit(cands):
+                if result.is_strong:
                     provider_stats[provider.name]["hits"] += 1
-                    accumulator[person.row_id] = result
-                    self._save_cached(result)
-                else:
-                    if idx + 1 < len(providers):
-                        pending[providers[idx + 1].name].append(person)
-                    accumulator[person.row_id] = result
+                elif idx + 1 < len(providers):
+                    pending[providers[idx + 1].name].append(person)
+
+                if changed:
                     self._save_cached(result)
 
     # ---------- stats ----------
@@ -350,7 +311,6 @@ class Orchestrator:
         path.write_text(json.dumps(existing, indent=2))
 
     def coverage_table(self) -> Table:
-        """Render the per-pass coverage table for printing."""
         t = Table(
             "Pass",
             "Strong (HIGH+verified)",

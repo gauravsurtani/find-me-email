@@ -1,59 +1,33 @@
 """Broad Google SERP provider via Apify (no `site:` restriction).
 
-Complement to `apify_school_serp` (which is school-domain-locked) and `exa`
-(neural search). This one hits Google's regular index with broader queries
-to surface emails on:
-  - Personal websites + portfolio pages
-  - GitHub README files
-  - Conference attendee/speaker pages
-  - News / press / interviews
-  - arXiv + paper preprint PDFs (which often have author emails)
-
-Why not just rely on Exa? Exa's neural ranking sometimes misses sparse
-contact-page hits and over-weights prose-rich content. Direct Google SERP
-catches "tail" pages Exa skips, especially for students whose presence is
-limited to a single CV page or conference appearance.
-
-Same actor + scoring logic as `apify_school_serp`; the difference is purely
-in the query template and how we score domain matches.
+Complement to `apify_school_serp` (school-domain-locked) and `exa` (neural).
+Hits Google's regular index for personal sites, conference pages, GitHub
+READMEs, and paper PDFs.
 """
 from __future__ import annotations
 
 import asyncio
 import re
+import string
 from typing import Any
 
 import httpx
 
 from find_me_email.apify_client import ApifyClient
+from find_me_email.providers._emailmatch import (
+    EMAIL_RE,
+    PERSONAL_PROVIDER_DOMAINS,
+    is_usable_local_part,
+    loose_match_query,
+    match_flags,
+    merge_candidate,
+    normalize_email,
+    person_tokens,
+)
 from find_me_email.providers.base import EnrichmentProvider
 from find_me_email.schemas import Confidence, EmailCandidate, Person
 
-EMAIL_RE = re.compile(r"[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}")
 DEFAULT_ACTOR = "apify/google-search-scraper"
-
-# Public-noise local parts that show up in scraped HTML but rarely belong
-# to the target person.
-ROLE_LOCAL_PARTS = {
-    "info",
-    "contact",
-    "support",
-    "admin",
-    "help",
-    "hello",
-    "webmaster",
-    "noreply",
-    "no-reply",
-    "press",
-    "marketing",
-    "sales",
-    "hr",
-    "jobs",
-    "careers",
-    "team",
-    "office",
-    "general",
-}
 
 
 class ApifyBroadSerpProvider(EnrichmentProvider):
@@ -69,8 +43,6 @@ class ApifyBroadSerpProvider(EnrichmentProvider):
         self.language_code: str = self.config.get("language_code", "en")
         self.fetch_top_pages: int = int(self.config.get("fetch_top_pages", 3))
         self.fetch_timeout_s: float = float(self.config.get("fetch_timeout_s", 8.0))
-        # Override: provide a list of query templates. Each template is
-        # `.format(name=..., school=..., domain=...)`-substituted per person.
         self.query_templates: list[str] = self.config.get(
             "query_templates",
             [
@@ -120,40 +92,32 @@ class ApifyBroadSerpProvider(EnrichmentProvider):
             )
 
         per_person: dict[str, dict[str, EmailCandidate]] = {p.row_id: {} for p in people}
-        followups: list[tuple[str, str]] = []  # (row_id, url)
+        followups: list[tuple[str, str]] = []
         person_by_row = {p.row_id: p for p in people}
+        tokens_by_row = {p.row_id: person_tokens(p) for p in people}
+        domain_by_row = {p.row_id: (p.school_domain or "").lower() for p in people}
 
         for item in items:
             term = (item.get("searchQuery") or {}).get("term") or ""
-            row_id = query_to_row.get(term) or self._loose_match(term, query_to_row)
+            row_id = query_to_row.get(term) or loose_match_query(term, query_to_row)
             if row_id is None:
                 continue
-            person = person_by_row.get(row_id)
-            if person is None:
-                continue
-            person_tokens = self._person_tokens(person)
-            target_domain = (person.school_domain or "").lower()
+            tokens = tokens_by_row[row_id]
+            target_domain = domain_by_row[row_id]
 
-            organic = item.get("organicResults") or []
             page_fetch_count = 0
-            for result in organic:
+            for result in item.get("organicResults") or []:
                 url = result.get("url") or ""
-                title = result.get("title") or ""
-                description = result.get("description") or ""
-                blob = " ".join([title, description])
+                blob = " ".join(
+                    [result.get("title") or "", result.get("description") or ""]
+                )
 
                 for raw in EMAIL_RE.findall(blob):
-                    email = raw.lower().strip(".,;:()<>[]{}\"' ")
-                    if not self._is_usable(email):
+                    email = normalize_email(raw)
+                    if not is_usable_local_part(email):
                         continue
-                    self._merge(
-                        per_person[row_id],
-                        email,
-                        person_tokens,
-                        target_domain,
-                        source_url=url,
-                        query=term,
-                        origin="snippet",
+                    self._record(
+                        per_person[row_id], email, tokens, target_domain, url, term, "snippet"
                     )
 
                 if (
@@ -165,7 +129,9 @@ class ApifyBroadSerpProvider(EnrichmentProvider):
                     page_fetch_count += 1
 
         if followups:
-            await self._fetch_followups(followups, person_by_row, per_person)
+            await self._fetch_followups(
+                followups, tokens_by_row, domain_by_row, per_person
+            )
 
         per_person_cost = self.cost_per_call_usd
         for row_id, by_email in per_person.items():
@@ -186,77 +152,47 @@ class ApifyBroadSerpProvider(EnrichmentProvider):
         out: list[str] = []
         for tmpl in self.query_templates:
             try:
-                # Skip templates whose required slots aren't populated, to avoid
-                # producing nonsense like '"Jane Doe" ""  email'.
-                needed = {f for _, f, _, _ in self._iter_format_fields(tmpl) if f}
+                # Skip templates whose required slots are empty so we don't
+                # produce nonsense like '"Jane Doe" ""  email'.
+                needed = {f for _, f, _, _ in string.Formatter().parse(tmpl) if f}
                 if any(not ctx.get(f) for f in needed):
                     continue
-                q = tmpl.format(**ctx).strip()
-                # Collapse double spaces from empty fields, just in case
-                q = re.sub(r"\s{2,}", " ", q)
+                q = re.sub(r"\s{2,}", " ", tmpl.format(**ctx).strip())
                 if q and q not in out:
                     out.append(q)
             except (KeyError, IndexError):
                 continue
         return out
 
-    @staticmethod
-    def _iter_format_fields(tmpl: str):
-        import string
-        return string.Formatter().parse(tmpl)
-
-    @staticmethod
-    def _is_usable(email: str) -> bool:
-        if "@" not in email:
-            return False
-        local = email.split("@", 1)[0].lower()
-        return local not in ROLE_LOCAL_PARTS
-
-    @staticmethod
-    def _loose_match(term: str, query_to_row: dict[str, str]) -> str | None:
-        norm = re.sub(r"\s+", " ", term.strip().lower())
-        for q, rid in query_to_row.items():
-            if re.sub(r"\s+", " ", q.strip().lower()) == norm:
-                return rid
-        return None
-
-    @staticmethod
-    def _person_tokens(person: Person) -> set[str]:
-        tokens: set[str] = set()
-        for s in (person.name, person.first_name, person.last_name):
-            if not s:
-                continue
-            for t in re.split(r"[^a-z]+", s.lower()):
-                if len(t) >= 3:
-                    tokens.add(t)
-        return tokens
+    def _record(
+        self,
+        bag: dict[str, EmailCandidate],
+        email: str,
+        tokens: set[str],
+        target_domain: str,
+        source_url: str,
+        query: str,
+        origin: str,
+    ) -> None:
+        confidence, base = self._score(email, tokens, target_domain)
+        merge_candidate(
+            bag,
+            email=email,
+            confidence=confidence,
+            notes=f"{base} ({origin})",
+            source_provider=self.name,
+            raw={"source_url": source_url, "query": query, "via": origin},
+        )
 
     @staticmethod
     def _score(
-        email: str, person_tokens: set[str], target_domain: str
+        email: str, tokens: set[str], target_domain: str
     ) -> tuple[Confidence, str]:
-        local, _, dom = email.partition("@")
-        local_lower = local.lower()
-        token_match = (
-            any(tok in local_lower for tok in person_tokens) if person_tokens else False
-        )
-        domain_match = (
-            bool(target_domain) and dom.endswith(target_domain.lstrip("."))
-        )
-        # Personal email providers: stronger signal when name matches.
-        is_personal_provider = dom in {
-            "gmail.com",
-            "outlook.com",
-            "hotmail.com",
-            "yahoo.com",
-            "icloud.com",
-            "me.com",
-            "proton.me",
-            "protonmail.com",
-        }
+        token_match, domain_match = match_flags(email, tokens, target_domain)
+        dom = email.partition("@")[2]
         if token_match and domain_match:
             return Confidence.MEDIUM, "broad_serp: name+school both match"
-        if token_match and is_personal_provider:
+        if token_match and dom in PERSONAL_PROVIDER_DOMAINS:
             return (
                 Confidence.LOW,
                 "broad_serp: name matches local-part on personal-email provider",
@@ -267,43 +203,11 @@ class ApifyBroadSerpProvider(EnrichmentProvider):
             return Confidence.LOW, "broad_serp: domain matches school but local-part doesn't"
         return Confidence.SPECULATIVE, "broad_serp: weak match (no name/domain overlap)"
 
-    def _merge(
-        self,
-        bag: dict[str, EmailCandidate],
-        email: str,
-        person_tokens: set[str],
-        target_domain: str,
-        source_url: str,
-        query: str,
-        origin: str,
-    ) -> None:
-        confidence, base_note = self._score(email, person_tokens, target_domain)
-        note = f"{base_note} ({origin})"
-        existing = bag.get(email)
-        if existing is None:
-            bag[email] = EmailCandidate(
-                email=email,
-                confidence=confidence,
-                source_provider=self.name,
-                verified=False,
-                notes=note,
-                raw={"source_url": source_url, "query": query, "via": origin},
-            )
-            return
-        order = {
-            Confidence.HIGH: 0,
-            Confidence.MEDIUM: 1,
-            Confidence.LOW: 2,
-            Confidence.SPECULATIVE: 3,
-        }
-        if order[confidence] < order[existing.confidence]:
-            existing.confidence = confidence
-            existing.notes = note
-
     async def _fetch_followups(
         self,
         followups: list[tuple[str, str]],
-        person_by_row: dict[str, Person],
+        tokens_by_row: dict[str, set[str]],
+        domain_by_row: dict[str, str],
         per_person: dict[str, dict[str, EmailCandidate]],
     ) -> None:
         sem = asyncio.Semaphore(8)
@@ -322,28 +226,24 @@ class ApifyBroadSerpProvider(EnrichmentProvider):
                 async with sem:
                     try:
                         r = await client.get(url)
-                        if r.status_code >= 400:
-                            return
-                        text = r.text
-                    except Exception:
+                    except httpx.HTTPError:
                         return
-                    person = person_by_row.get(row_id)
-                    if person is None:
+                    if r.status_code >= 400:
                         return
-                    person_tokens = self._person_tokens(person)
-                    target_domain = (person.school_domain or "").lower()
-                    for raw in EMAIL_RE.findall(text):
-                        email = raw.lower().strip(".,;:()<>[]{}\"' ")
-                        if not self._is_usable(email):
+                    tokens = tokens_by_row[row_id]
+                    target_domain = domain_by_row[row_id]
+                    for raw in EMAIL_RE.findall(r.text):
+                        email = normalize_email(raw)
+                        if not is_usable_local_part(email):
                             continue
-                        self._merge(
+                        self._record(
                             per_person[row_id],
                             email,
-                            person_tokens,
+                            tokens,
                             target_domain,
-                            source_url=url,
-                            query="(page fetch)",
-                            origin="page",
+                            url,
+                            "(page fetch)",
+                            "page",
                         )
 
             await asyncio.gather(
