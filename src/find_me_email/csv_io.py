@@ -89,9 +89,8 @@ def read_people(path: Path, sample: int | None = None, seed: int = 42) -> list[P
         df = df[df[cmap["linkedin_url"]].notna() & (df[cmap["linkedin_url"]] != "")]
 
     if sample and len(df) > sample:
-        df = df.sample(n=sample, random_state=seed).reset_index(drop=True)
-    else:
-        df = df.reset_index(drop=True)
+        df = df.sample(n=sample, random_state=seed)
+    # Preserve original row positions so row_id matches read_truth across sampling/filtering.
 
     people: list[Person] = []
     for idx, row in df.iterrows():

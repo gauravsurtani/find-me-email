@@ -36,7 +36,10 @@ class ApifyB2BLeadsProvider(EnrichmentProvider):
             return {p.row_id: [] for p in people}
 
         url_to_row: dict[str, str] = {str(p.linkedin_url): p.row_id for p in targets}
-        payload = {"profileUrls": list(url_to_row.keys())}
+        payload = {
+            "profileUrls": list(url_to_row.keys()),
+            "enableEmailEnrichment": True,
+        }
 
         async with ApifyClient() as ac:
             items = await ac.run_actor_sync(self.actor_id, payload, wait_secs=self.timeout_s)
@@ -53,35 +56,64 @@ class ApifyB2BLeadsProvider(EnrichmentProvider):
         return out
 
     def _match_row(self, item: dict[str, Any], url_to_row: dict[str, str]) -> str | None:
-        for k in ("profileUrl", "linkedinUrl", "url", "input"):
+        # Build identifier index: every URL maps to the row by public identifier
+        # (last path segment) and by url-with-/-without "www." normalized.
+        def _ident(u: str) -> str:
+            u = u.strip().rstrip("/").lower()
+            if "/in/" in u:
+                u = u.split("/in/", 1)[1].split("/", 1)[0].split("?", 1)[0]
+            return u
+
+        ident_to_row = {_ident(u): rid for u, rid in url_to_row.items()}
+        # Try the obvious URL fields, then fall back to the actor's own publicIdentifier.
+        for k in ("publicIdentifier", "public_identifier", "profileUrl", "linkedinUrl",
+                  "url", "input"):
             v = item.get(k)
-            if isinstance(v, str) and v in url_to_row:
-                return url_to_row[v]
-        for url, rid in url_to_row.items():
-            if any(url in str(v) for v in item.values() if isinstance(v, str)):
-                return rid
+            if isinstance(v, str):
+                ident = _ident(v)
+                if ident in ident_to_row:
+                    return ident_to_row[ident]
+        # Last resort: scan all string fields.
+        for v in item.values():
+            if isinstance(v, str):
+                ident = _ident(v)
+                if ident in ident_to_row:
+                    return ident_to_row[ident]
         return None
 
     def _extract_emails(self, item: dict[str, Any]) -> list[EmailCandidate]:
-        emails: set[str] = set()
-        for k in ("email", "emailAddress", "workEmail", "personalEmail"):
-            v = item.get(k)
-            if isinstance(v, str) and "@" in v:
-                emails.add(v.strip().lower())
+        # email -> per-email metadata (deliverable/status/qualityScore) when available
+        found: dict[str, dict[str, Any]] = {}
+
+        def _add(addr: str | None, meta: dict[str, Any] | None = None):
+            if not isinstance(addr, str) or "@" not in addr:
+                return
+            key = addr.strip().lower()
+            if key not in found:
+                found[key] = meta or {}
+
+        for k in ("email", "emailAddress", "workEmail", "personalEmail", "best_email"):
+            _add(item.get(k))
         for k in ("emails", "contactEmails"):
             v = item.get(k)
             if isinstance(v, list):
                 for e in v:
-                    if isinstance(e, str) and "@" in e:
-                        emails.add(e.strip().lower())
-        return [
-            EmailCandidate(
-                email=e,
-                confidence=Confidence.MEDIUM,
-                source_provider=self.name,
-                verified=False,
-                notes="Direct DB match from b2b_leads actor",
-                raw=item,
+                    if isinstance(e, str):
+                        _add(e)
+                    elif isinstance(e, dict):
+                        _add(e.get("email") or e.get("emailAddress") or e.get("address"), e)
+        cands = []
+        for addr, meta in found.items():
+            verified = bool(meta.get("deliverable") or meta.get("status") == "valid")
+            cands.append(
+                EmailCandidate(
+                    email=addr,
+                    confidence=Confidence.HIGH if verified else Confidence.MEDIUM,
+                    source_provider=self.name,
+                    verified=verified,
+                    notes="Direct DB match from b2b_leads actor"
+                    + (f" (status={meta.get('status')}, score={meta.get('qualityScore')})" if meta else ""),
+                    raw=item,
+                )
             )
-            for e in emails
-        ]
+        return cands
