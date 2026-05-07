@@ -114,8 +114,8 @@ def main():
             "harv_all": "|".join(e["email"] for e in harv_e),
             "b2b_exact": int(any(e["email"] == truth for e in b2b_e)),
             "harv_exact": int(any(e["email"] == truth for e in harv_e)),
-            "b2b_domain": int(any(e["email"].endswith("@" + truth_domain) for e in b2b_e) and truth_domain),
-            "harv_domain": int(any(e["email"].endswith("@" + truth_domain) for e in harv_e) and truth_domain),
+            "b2b_domain": int(bool(truth_domain) and any(e["email"].endswith("@" + truth_domain) for e in b2b_e)),
+            "harv_domain": int(bool(truth_domain) and any(e["email"].endswith("@" + truth_domain) for e in harv_e)),
             "b2b_any_email": int(bool(b2b_e)),
             "harv_any_email": int(bool(harv_e)),
         })
