@@ -9,7 +9,7 @@ from rich.console import Console
 from rich.table import Table
 
 from find_me_email.apify_client import ApifyClient
-from find_me_email.csv_io import read_people, write_results
+from find_me_email.csv_io import read_people, read_truth, write_results
 from find_me_email.learning import recommend_cascade
 from find_me_email.orchestrator import Orchestrator
 from find_me_email.settings import settings
@@ -127,6 +127,68 @@ def stats(config: Path = typer.Option(DEFAULT_CONFIG, exists=True)):
     for name, rate in rec:
         table.add_row(name, f"{rate:.0%}")
     console.print(table)
+
+
+@app.command()
+def benchmark(
+    labeled_csv: Path = typer.Argument(..., exists=True, readable=True,
+                                       help="One CSV/TSV containing both inputs AND known emails"),
+    sample: int | None = typer.Option(None, help="Subset to N random rows"),
+    seed: int = typer.Option(42),
+    config: Path = typer.Option(DEFAULT_CONFIG, exists=True),
+    out: Path = typer.Option(Path("data/output/benchmark_report.md")),
+    force: bool = typer.Option(False, help="Ignore per-row cache"),
+    dry_run: bool = typer.Option(False, help="Print plan + estimate, don't call providers"),
+):
+    """Hide email columns, run cascade, score predictions against the hidden truth.
+
+    Use this BEFORE running on unlabeled data — it tells you the real hit rate.
+    """
+    truth = read_truth(labeled_csv)
+    people = read_people(labeled_csv, sample=sample, seed=seed)
+    # Dedupe by linkedin_url so duplicated rows don't double-bill
+    seen_urls: set[str] = set()
+    unique: list = []
+    for p in people:
+        url = str(p.linkedin_url) if p.linkedin_url else p.row_id
+        if url in seen_urls:
+            continue
+        seen_urls.add(url)
+        unique.append(p)
+    people = unique
+
+    print(f"[bold]{len(people)}[/bold] unique people, [bold]{len(truth)}[/bold] with known emails")
+
+    orch = Orchestrator(config)
+    table = Table("Provider", "Cost/call", "Worst-case total")
+    for prov in orch.providers:
+        wc = prov.cost_per_call_usd * len(people)
+        table.add_row(prov.name, f"${prov.cost_per_call_usd:.4f}", f"${wc:.2f}")
+    console.print(table)
+    print(f"[yellow]Worst-case spend: ~${sum(p.cost_per_call_usd for p in orch.providers) * len(people):.2f}"
+          f" (budget cap ${orch.budget_usd:.2f})[/yellow]")
+
+    if dry_run:
+        print("\n[dim]Dry run — no provider calls made.[/dim]")
+        return
+
+    async def _run():
+        return await orch.run(people, force_refresh=force)
+
+    print("\n[cyan]Running cascade…[/cyan]")
+    results = asyncio.run(_run())
+
+    enriched_path = out.parent / (out.stem.replace("_report", "") + "_predictions.csv")
+    enriched_path.parent.mkdir(parents=True, exist_ok=True)
+    write_results(results, enriched_path)
+
+    report = run_validate(results, truth)
+    out.write_text(report.to_markdown())
+    print()
+    print(report.to_markdown())
+    print(f"\n[green]✓[/green] predictions: {enriched_path}")
+    print(f"[green]✓[/green] report:      {out}")
+    print(f"Actual spend: [bold]${orch.spent_usd:.4f}[/bold]")
 
 
 if __name__ == "__main__":
