@@ -103,13 +103,26 @@ passes:
           - "{first}_{middle}_{last}@{domain}"
         notes: Last-resort guess. Always marked low-confidence with explicit warning.
 
-# Email verification (TODO: wire as a final pass).
-# Recommended actor: account56/email-verifier (Million Verifier) — $1/1000
-# decisive verifications, free on catch-all/unknown. Promotes SPECULATIVE
-# pattern-guess candidates to LOW-verified or marks them as bouncing.
+# Email verification — runs as a post-pass step on all unverified candidates.
+# Enabled by setting `actor_id` to a real Apify verifier actor.
+#
+# Recommended: `account56/email-verifier` (Million Verifier) — $1 per 1000
+# DECISIVE verifications, free on catch-all/unknown/error outcomes.
+# For a 57-row run with ~1700 candidates, expect roughly $1.50.
+#
+# Behavior:
+#   - candidates with result=ok       → marked verified=true
+#                                     → SPECULATIVE pattern guesses promoted to LOW
+#   - candidates with result=invalid  → dropped from output (mailbox bounces)
+#   - catch_all/unknown/disposable    → kept, but annotated in `notes`
+#   - already-verified candidates are skipped (saves $$ on re-runs)
 verifier:
-  name: apify_email_verifier
-  actor_id: ""  # set to "account56/email-verifier" once wired
+  name: apify_million_verifier
+  actor_id: "michael.g/email-verifier-validator"  # ~$0.60/1000, publicly callable
+  timeout_s: 1800
+  promote_verified_speculative_to: low
+  drop_invalid: true
+  skip_already_verified: true
   hunter_fallback: false  # set true once HUNTER_API_KEY is set
 
 budget:

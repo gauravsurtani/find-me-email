@@ -29,6 +29,7 @@ from find_me_email.providers import build_provider
 from find_me_email.providers.base import EnrichmentProvider
 from find_me_email.schemas import Confidence, EmailCandidate, EnrichmentResult, Person
 from find_me_email.settings import settings
+from find_me_email.verifier import build_verifier
 
 console = Console()
 
@@ -115,8 +116,38 @@ class Orchestrator:
         self, people: list[Person], force_refresh: bool = False
     ) -> list[EnrichmentResult]:
         if self.mode == "passes":
-            return await self._run_passes(people, force_refresh=force_refresh)
-        return await self._run_cascade_legacy(people, force_refresh=force_refresh)
+            results = await self._run_passes(people, force_refresh=force_refresh)
+        else:
+            results = await self._run_cascade_legacy(
+                people, force_refresh=force_refresh
+            )
+        # Optional final verification step.
+        verifier = build_verifier(self.cfg.get("verifier") or {})
+        if verifier is not None:
+            results = await verifier.verify(results)
+            for r in results:
+                self._save_cached(r)
+            # Append a final coverage row reflecting post-verification state,
+            # so the user can see the value the verifier added.
+            verified_count = sum(
+                1
+                for r in results
+                if any(c.verified for c in r.candidates if c.email)
+            )
+            self.coverage_per_pass.append(
+                {
+                    "pass": f"verifier ({verifier.name})",
+                    "any_candidate": sum(
+                        1 for r in results if _has_any_candidate(r.candidates)
+                    ),
+                    "medium_or_better": sum(
+                        1 for r in results if _has_medium_or_better(r.candidates)
+                    ),
+                    "strong": verified_count,  # any verified mailbox counts as "strong" now
+                    "total": len(results),
+                }
+            )
+        return results
 
     # ---------- multi-pass mode ----------
 
