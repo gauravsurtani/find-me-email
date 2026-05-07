@@ -45,12 +45,22 @@ def estimate(
     people = read_people(input_csv, sample=sample)
     cfg = yaml.safe_load(config.read_text())
     print(f"[bold]{len(people)}[/bold] people to enrich")
+
+    # Flatten passes: into a single cascade-equivalent provider list for the
+    # cost table. Worst case = every provider runs on every row.
+    if "passes" in cfg and cfg["passes"]:
+        flat = []
+        for ps in cfg["passes"]:
+            for p in ps.get("providers", []):
+                if p.get("enabled", True):
+                    flat.append(p)
+    else:
+        flat = [p for p in cfg.get("cascade", []) if p.get("enabled", True)]
+
     table = Table("Provider", "Cost/call", "Worst-case total")
     total = 0.0
-    for p in cfg["cascade"]:
-        if not p.get("enabled", True):
-            continue
-        from find_me_email.providers import build_provider
+    from find_me_email.providers import build_provider
+    for p in flat:
         prov = build_provider(p["name"], p)
         wc = prov.cost_per_call_usd * len(people)
         total += wc
@@ -69,13 +79,31 @@ def enrich(
     config: Path = typer.Option(DEFAULT_CONFIG, exists=True),
     force: bool = typer.Option(False, help="Ignore per-row cache"),
 ):
-    """Run the cascade and write enriched CSV."""
+    """Run the cascade and write enriched CSV.
+
+    If `passes:` is configured, runs each pass on the not-yet-strong subset
+    and writes a checkpoint CSV after every pass.
+    """
     people = read_people(input_csv, sample=sample, seed=seed)
     print(f"Loaded [bold]{len(people)}[/bold] people from {input_csv}")
     if sample:
         print(f"[dim](random sample, seed={seed})[/dim]")
 
     orch = Orchestrator(config)
+
+    # Per-pass checkpoint writer. We name files <stem>_pass_NN_<name>.csv
+    # next to the final output so the user can compare deltas.
+    if orch.mode == "passes":
+        ckpt_dir = output_csv.parent
+        ckpt_dir.mkdir(parents=True, exist_ok=True)
+        stem = output_csv.stem
+
+        def _write_checkpoint(pass_idx: int, pass_name: str, results) -> None:
+            path = ckpt_dir / f"{stem}_pass_{pass_idx:02d}_{pass_name}.csv"
+            write_results(results, path)
+            print(f"  [dim]checkpoint: {path}[/dim]")
+
+        orch.checkpoint_writer = _write_checkpoint
 
     async def _run():
         return await orch.run(people, force_refresh=force)
@@ -87,6 +115,10 @@ def enrich(
     found = sum(1 for r in results if r.best)
     print(f"\n[green]✓[/green] wrote {output_csv} ({found}/{len(results)} with at least one candidate)")
     print(f"Total spend: [bold]${orch.spent_usd:.2f}[/bold] (budget ${orch.budget_usd:.2f})")
+
+    if orch.mode == "passes" and orch.coverage_per_pass:
+        console.print()
+        console.print(orch.coverage_table())
 
 
 @app.command()

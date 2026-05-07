@@ -1,70 +1,121 @@
-# Cascade order: each provider tried only if prior providers didn't return a verified email.
-# Add/remove providers by editing this file — no code changes needed.
-cascade:
-  - name: apify_b2b_leads
-    enabled: true
-    actor_id: b2b_leads/linkedin-profile-scraper
-    timeout_s: 1800
-    notes: Pay-per-result LinkedIn email finder. Cheapest first pass.
+# Multi-pass enrichment.
+#
+# Each pass runs as a mini-cascade on the rows that aren't yet HIGH+verified.
+# After every pass we write a checkpoint CSV next to the final output, so you
+# can see exactly what each strategy contributed.
+#
+# Strategy ordering: highest-precision-first. LinkedIn DB lookups, then
+# narrow web sources (school directories), then user-controlled emails
+# (GitHub commit history), then broader web (Exa neural + Google SERP),
+# then deterministic pattern guess as a last-resort floor that always
+# produces *something*.
+#
+# Add new passes here without code changes — just register the provider in
+# src/find_me_email/providers/__init__.py first.
+passes:
+  - name: linkedin
+    providers:
+      - name: apify_b2b_leads
+        enabled: true
+        actor_id: b2b_leads/linkedin-profile-scraper
+        timeout_s: 1800
+        notes: Pay-per-result LinkedIn email finder. Cheapest first pass.
 
-  - name: apify_harvestapi
-    enabled: true
-    actor_id: harvestapi/linkedin-profile-scraper
-    timeout_s: 1800
-    mode: full_with_email
-    notes: Higher-quality fallback; SMTP-validated emails.
+      - name: apify_harvestapi
+        enabled: true
+        actor_id: harvestapi/linkedin-profile-scraper
+        timeout_s: 1800
+        mode: full_with_email
+        notes: Higher-quality fallback; SMTP-validated emails.
 
-  - name: apify_school_serp
-    enabled: true
-    actor_id: apify/google-search-scraper
-    timeout_s: 1200
-    results_per_query: 10
-    max_domains_per_person: 2
-    fetch_top_pages: 3
-    fetch_timeout_s: 8.0
-    notes: |
-      Google search restricted to the school's .edu domain. Forces results
-      to come from the school's own subdomains where directories, department
-      pages, and lab sites live — avoids the wrong-person hits Exa returns
-      when the same name exists elsewhere on the web.
+  - name: school_domain
+    providers:
+      - name: apify_school_serp
+        enabled: true
+        actor_id: apify/google-search-scraper
+        timeout_s: 1200
+        results_per_query: 10
+        max_domains_per_person: 2
+        fetch_top_pages: 3
+        fetch_timeout_s: 8.0
+        notes: |
+          Google search restricted to the school's .edu domain. Forces
+          results to come from school directories, lab pages, profile sites.
 
-  - name: exa
-    enabled: true
-    num_results: 5
-    use_contents: true
-    timeout_s: 30
-    notes: Neural web search for emails on personal sites, papers, lab pages, GitHub.
+  - name: github
+    providers:
+      - name: github_email_leak
+        enabled: true
+        timeout_s: 20.0
+        max_username_candidates: 3
+        max_repos_to_scan: 5
+        max_commits_per_repo: 30
+        notes: |
+          Search GitHub by name, then pull commit-author emails from public
+          events + recent repos. Free, but rate-limited (60/hr unauth, 5000/hr
+          with GITHUB_TOKEN). Set GITHUB_TOKEN in .env.
 
-  - name: college_pattern_guess
-    enabled: true
-    require_school_or_domain: true
-    # Patterns are tried against EVERY domain candidate for the school
-    # (primary + subdomains from SUBDOMAIN_VARIANTS). Middle-name patterns
-    # are skipped automatically when there's no middle name.
-    patterns:
-      - "{first}.{last}@{domain}"
-      - "{first}{last}@{domain}"
-      - "{f}{last}@{domain}"
-      - "{first}{l}@{domain}"
-      - "{first}_{last}@{domain}"
-      - "{first}@{domain}"
-      - "{last}.{first}@{domain}"
-      - "{first}{middle}.{last}@{domain}"
-      - "{first}{middle}{last}@{domain}"
-      - "{first}.{middle}.{last}@{domain}"
-      - "{first}_{middle}_{last}@{domain}"
-    notes: Last-resort guess. Always marked low-confidence with explicit warning.
+  - name: web_search
+    providers:
+      - name: exa
+        enabled: true
+        num_results: 5
+        use_contents: true
+        timeout_s: 30
+        notes: Neural web search for emails on personal sites, papers, lab pages.
 
+  - name: broad_search
+    providers:
+      - name: apify_broad_serp
+        enabled: true
+        actor_id: apify/google-search-scraper
+        timeout_s: 1200
+        results_per_query: 10
+        fetch_top_pages: 3
+        fetch_timeout_s: 8.0
+        query_templates:
+          - '"{name}" "{school}" email'
+          - '"{name}" CV resume contact'
+        notes: |
+          Broad Google search (no site: restriction). Catches personal
+          websites, conference attendee pages, paper PDFs, GitHub READMEs.
+          Complements Exa's neural search with Google's text index.
+
+  - name: pattern_guess
+    providers:
+      - name: college_pattern_guess
+        enabled: true
+        require_school_or_domain: true
+        # Patterns are tried against EVERY domain candidate for the school
+        # (primary + subdomains from SUBDOMAIN_VARIANTS). Middle-name patterns
+        # are skipped automatically when there's no middle name.
+        patterns:
+          - "{first}.{last}@{domain}"
+          - "{first}{last}@{domain}"
+          - "{f}{last}@{domain}"
+          - "{first}{l}@{domain}"
+          - "{first}_{last}@{domain}"
+          - "{first}@{domain}"
+          - "{last}.{first}@{domain}"
+          - "{first}{middle}.{last}@{domain}"
+          - "{first}{middle}{last}@{domain}"
+          - "{first}.{middle}.{last}@{domain}"
+          - "{first}_{middle}_{last}@{domain}"
+        notes: Last-resort guess. Always marked low-confidence with explicit warning.
+
+# Email verification (TODO: wire as a final pass).
+# Recommended actor: account56/email-verifier (Million Verifier) — $1/1000
+# decisive verifications, free on catch-all/unknown. Promotes SPECULATIVE
+# pattern-guess candidates to LOW-verified or marks them as bouncing.
 verifier:
   name: apify_email_verifier
-  actor_id: ""  # TODO: pin a verifier actor; until then skip verification
+  actor_id: ""  # set to "account56/email-verifier" once wired
   hunter_fallback: false  # set true once HUNTER_API_KEY is set
 
 budget:
   usd: 100
   stop_on_overrun: true
 
-# Provider stats accumulate here; the orchestrator reads/writes this.
 learning:
   stats_file: data/cache/provider_stats.json
   reorder_cascade: false  # turn on once you have >100 rows of history

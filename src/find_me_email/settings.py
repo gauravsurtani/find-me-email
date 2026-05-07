@@ -10,6 +10,7 @@ class Settings(BaseSettings):
     hunter_api_key: str = ""
     exa_api_key: str = ""
     apollo_api_key: str = ""
+    github_token: str = ""  # optional: lifts API rate limit from 60/hr to 5000/hr
     budget_usd: float = 100.0
 
     project_root: Path = Path(__file__).resolve().parents[2]
