@@ -17,13 +17,21 @@ cascade:
   - name: college_pattern_guess
     enabled: true
     require_school_or_domain: true
+    # Patterns are tried against EVERY domain candidate for the school
+    # (primary + subdomains from SUBDOMAIN_VARIANTS). Middle-name patterns
+    # are skipped automatically when there's no middle name.
     patterns:
       - "{first}.{last}@{domain}"
       - "{first}{last}@{domain}"
       - "{f}{last}@{domain}"
+      - "{first}{l}@{domain}"
       - "{first}_{last}@{domain}"
       - "{first}@{domain}"
       - "{last}.{first}@{domain}"
+      - "{first}{middle}.{last}@{domain}"
+      - "{first}{middle}{last}@{domain}"
+      - "{first}.{middle}.{last}@{domain}"
+      - "{first}_{middle}_{last}@{domain}"
     notes: Last-resort guess. Always marked low-confidence with explicit warning.
 
 verifier:
