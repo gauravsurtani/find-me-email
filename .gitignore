@@ -1,0 +1,32 @@
+# Secrets
+.env
+.env.local
+*.key
+
+# Data — never commit personal data or enrichment results
+data/input/*
+data/output/*
+data/cache/*
+data/ground_truth/*
+!data/input/.gitkeep
+!data/output/.gitkeep
+!data/cache/.gitkeep
+!data/ground_truth/.gitkeep
+
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+build/
+dist/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+.DS_Store

@@ -1,0 +1,19 @@
+from find_me_email.providers.apify_b2b_leads import ApifyB2BLeadsProvider
+from find_me_email.providers.apify_harvestapi import ApifyHarvestAPIProvider
+from find_me_email.providers.base import EnrichmentProvider
+from find_me_email.providers.college_pattern_guess import CollegePatternGuessProvider
+
+REGISTRY: dict[str, type[EnrichmentProvider]] = {
+    "apify_b2b_leads": ApifyB2BLeadsProvider,
+    "apify_harvestapi": ApifyHarvestAPIProvider,
+    "college_pattern_guess": CollegePatternGuessProvider,
+}
+
+
+def build_provider(name: str, config: dict) -> EnrichmentProvider:
+    if name not in REGISTRY:
+        raise KeyError(f"Unknown provider: {name}. Registered: {list(REGISTRY)}")
+    return REGISTRY[name](config)
+
+
+__all__ = ["EnrichmentProvider", "REGISTRY", "build_provider"]

@@ -1,0 +1,41 @@
+# Cascade order: each provider tried only if prior providers didn't return a verified email.
+# Add/remove providers by editing this file — no code changes needed.
+cascade:
+  - name: apify_b2b_leads
+    enabled: true
+    actor_id: b2b_leads/linkedin-profile-scraper
+    timeout_s: 600
+    notes: Pay-per-result LinkedIn email finder. Cheapest first pass.
+
+  - name: apify_harvestapi
+    enabled: true
+    actor_id: harvestapi/linkedin-profile-scraper
+    timeout_s: 600
+    mode: full_with_email
+    notes: Higher-quality fallback; SMTP-validated emails.
+
+  - name: college_pattern_guess
+    enabled: true
+    require_school_or_domain: true
+    patterns:
+      - "{first}.{last}@{domain}"
+      - "{first}{last}@{domain}"
+      - "{f}{last}@{domain}"
+      - "{first}_{last}@{domain}"
+      - "{first}@{domain}"
+      - "{last}.{first}@{domain}"
+    notes: Last-resort guess. Always marked low-confidence with explicit warning.
+
+verifier:
+  name: apify_email_verifier
+  actor_id: ""  # TODO: pin a verifier actor; until then skip verification
+  hunter_fallback: false  # set true once HUNTER_API_KEY is set
+
+budget:
+  usd: 100
+  stop_on_overrun: true
+
+# Provider stats accumulate here; the orchestrator reads/writes this.
+learning:
+  stats_file: data/cache/provider_stats.json
+  reorder_cascade: false  # turn on once you have >100 rows of history
