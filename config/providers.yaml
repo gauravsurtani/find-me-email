@@ -116,14 +116,29 @@ passes:
 #   - candidates with result=invalid  → dropped from output (mailbox bounces)
 #   - catch_all/unknown/disposable    → kept, but annotated in `notes`
 #   - already-verified candidates are skipped (saves $$ on re-runs)
+# Email verification — runs as a post-pass step on unverified candidates.
+# DISABLED by default: set actor_id to enable. Recommended actor:
+#   michael.g/email-verifier-validator  (~$0.60/1000 results + Apify compute)
+#
+# Cost guards — important. Without these, a 60-row run with full pattern_guess
+# can submit 900+ emails, most of which are pattern guesses on catch-all .edu
+# domains where the verifier returns useless "ok" verdicts. The defaults below
+# cap the per-run spend at roughly $0.30 by checking only the top 5 candidates
+# per row and skipping SPECULATIVE pattern-guesses when the row already has a
+# MEDIUM+ candidate. Adjust upward only if you've checked the math.
 verifier:
   name: apify_million_verifier
-  actor_id: "michael.g/email-verifier-validator"  # ~$0.60/1000, publicly callable
+  actor_id: ""  # set to "michael.g/email-verifier-validator" to enable
   timeout_s: 1800
+  cost_per_email_usd: 0.0006
+  max_per_row: 5                              # top-K candidates per person, by confidence
+  max_total: 500                              # global cap; aborts run with warning if exceeded
+  skip_speculative_when_medium_exists: true   # cuts most pattern_guess noise
+  skip_already_verified: true                 # save on re-runs
   promote_verified_speculative_to: low
   drop_invalid: true
-  skip_already_verified: true
-  hunter_fallback: false  # set true once HUNTER_API_KEY is set
+  confirm_large_runs: true                    # abort if total > max_total instead of charging
+  hunter_fallback: false                      # set true once HUNTER_API_KEY is set
 
 budget:
   usd: 100

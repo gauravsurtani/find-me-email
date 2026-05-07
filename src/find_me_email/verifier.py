@@ -47,13 +47,27 @@ class ApifyMillionVerifier(EmailVerifier):
     def __init__(self, config: dict[str, Any]):
         self.actor_id: str = config.get("actor_id") or "michael.g/email-verifier-validator"
         self.timeout_s: int = int(config.get("timeout_s", 1800))
-        # Per-decisive-result rate; budget tracking multiplies this by checked count.
         self.cost_per_call_usd = float(config.get("cost_per_email_usd", 0.0006))
         self.promote_speculative_to: str = config.get(
             "promote_verified_speculative_to", "low"
         )
         self.drop_invalid: bool = bool(config.get("drop_invalid", True))
         self.skip_already_verified: bool = bool(config.get("skip_already_verified", True))
+        # Cost guards. The verifier bills per-result on a paid Apify actor —
+        # a 60-row run with pattern_guess generating ~10 candidates each can
+        # easily hit ~600+ emails, most of which are pattern guesses that are
+        # almost certainly wrong. These caps stop us from paying to verify
+        # noise.
+        self.max_per_row: int = int(config.get("max_per_row", 5))
+        self.max_total: int = int(config.get("max_total", 500))
+        # If a row already has a MEDIUM+ candidate, skip its SPECULATIVE
+        # entries (almost all of which come from pattern_guess).
+        self.skip_speculative_when_medium_exists: bool = bool(
+            config.get("skip_speculative_when_medium_exists", True)
+        )
+        # When True, abort if we'd verify more than `max_total` and nothing was
+        # explicitly opted-in. Print a warning instead.
+        self.confirm_large_runs: bool = bool(config.get("confirm_large_runs", True))
 
     async def verify(
         self, results: list[EnrichmentResult]
@@ -63,9 +77,24 @@ class ApifyMillionVerifier(EmailVerifier):
             console.print("[dim]verifier: no unverified candidates to check[/dim]")
             return results
 
+        if len(emails_to_check) > self.max_total and self.confirm_large_runs:
+            console.print(
+                f"[red]verifier: would check {len(emails_to_check)} emails "
+                f"(over max_total={self.max_total}). "
+                f"Estimated cost ~${len(emails_to_check) * self.cost_per_call_usd:.2f} "
+                f"plus Apify compute. SKIPPING to protect budget.[/red]"
+            )
+            console.print(
+                "[yellow]Raise verifier.max_total in providers.yaml or tighten "
+                "verifier.max_per_row / skip_speculative_when_medium_exists "
+                "to opt in.[/yellow]"
+            )
+            return results
+
+        est_cost = len(emails_to_check) * self.cost_per_call_usd
         console.print(
             f"[cyan]→ verifier ({self.name})[/cyan] "
-            f"checking {len(emails_to_check)} unique emails"
+            f"checking {len(emails_to_check)} unique emails (~${est_cost:.2f} + Apify compute)"
         )
 
         async with ApifyClient() as ac:
@@ -84,14 +113,45 @@ class ApifyMillionVerifier(EmailVerifier):
         return results
 
     def _collect_emails(self, results: list[EnrichmentResult]) -> set[str]:
+        """Collect candidate emails to verify, applying per-row + global caps.
+
+        Filters in order:
+          1. Skip already-verified (when configured)
+          2. Skip SPECULATIVE rows when a MEDIUM+ already exists (cuts pattern_guess noise)
+          3. Take top-K per row by confidence (default 5)
+          4. Cap by global max_total
+        """
         out: set[str] = set()
         for r in results:
-            for c in r.candidates:
-                if not c.email or "@" not in c.email:
-                    continue
-                if self.skip_already_verified and c.verified:
-                    continue
-                out.add(c.email.lower())
+            row_emails = self._select_row_emails(r)
+            for email in row_emails:
+                out.add(email)
+                if len(out) >= self.max_total:
+                    return out
+        return out
+
+    def _select_row_emails(self, r: EnrichmentResult) -> list[str]:
+        """Top-K emails for a single row, post-filter."""
+        cands = [
+            c for c in r.candidates
+            if c.email and "@" in c.email
+            and not (self.skip_already_verified and c.verified)
+        ]
+        if self.skip_speculative_when_medium_exists:
+            has_medium = any(c.confidence.rank <= Confidence.MEDIUM.rank for c in cands)
+            if has_medium:
+                cands = [c for c in cands if c.confidence != Confidence.SPECULATIVE]
+        cands.sort(key=lambda c: c.confidence.rank)
+        seen: set[str] = set()
+        out: list[str] = []
+        for c in cands:
+            email = c.email.lower()
+            if email in seen:
+                continue
+            seen.add(email)
+            out.append(email)
+            if len(out) >= self.max_per_row:
+                break
         return out
 
     def _index_verdicts(
