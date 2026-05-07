@@ -87,6 +87,23 @@ def resolve_domain(school: str | None) -> str | None:
     return _heuristic(s)
 
 
+def extract_school_from_text(*texts: str | None) -> str | None:
+    """Scan free-form text (headline, location, etc.) for any known school name.
+
+    Returns the canonical school name if a known one is found, else None.
+    Used when the source CSV has no `school` column but headlines like
+    "CS @ Stanford" or "UC Berkeley | Researcher" carry the school inline.
+    """
+    haystack = " ".join(t for t in texts if t).lower()
+    if not haystack:
+        return None
+    # Sort longest-first so "san jose state university" matches before "san jose"
+    for key in sorted(KNOWN, key=len, reverse=True):
+        if key in haystack:
+            return key
+    return None
+
+
 def _heuristic(s: str) -> str | None:
     tokens = [t for t in re.split(r"[^a-z0-9]+", s) if t and t not in STOPWORDS]
     if not tokens:

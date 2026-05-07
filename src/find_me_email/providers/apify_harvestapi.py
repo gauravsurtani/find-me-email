@@ -12,13 +12,23 @@ class ApifyHarvestAPIProvider(EnrichmentProvider):
     """Apify actor: harvestapi/linkedin-profile-scraper. Higher-quality fallback with SMTP-validated email."""
 
     name = "apify_harvestapi"
-    cost_per_call_usd = 0.008  # ~$8 / 1K profiles with email mode
+    cost_per_call_usd = 0.010  # $10 / 1K profiles in "+ email search" mode
+
+    # Exact enum values from the actor's input schema. Don't change unless the schema does.
+    MODE_NO_EMAIL = "Profile details no email ($4 per 1k)"
+    MODE_WITH_EMAIL = "Profile details + email search ($10 per 1k)"
 
     def __init__(self, config: dict | None = None):
         super().__init__(config)
         self.actor_id: str = self.config.get("actor_id", "harvestapi/linkedin-profile-scraper")
-        self.timeout_s: int = int(self.config.get("timeout_s", 600))
-        self.mode: str = self.config.get("mode", "full_with_email")
+        self.timeout_s: int = int(self.config.get("timeout_s", 1800))
+        # Allow either alias or the literal enum value in providers.yaml
+        cfg_mode = self.config.get("mode", "with_email")
+        self.mode: str = {
+            "no_email": self.MODE_NO_EMAIL,
+            "with_email": self.MODE_WITH_EMAIL,
+            "full_with_email": self.MODE_WITH_EMAIL,
+        }.get(cfg_mode, cfg_mode)
 
     def can_handle(self, person: Person) -> bool:
         return person.linkedin_url is not None

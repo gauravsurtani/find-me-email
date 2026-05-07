@@ -93,9 +93,12 @@ def validate(
     overall_hits = 0
     domain_hits = 0
     total_cost = 0.0
+    has_truth = 0  # only count truth entries for people in `results`
 
     for r in results:
         true_emails = truth.get(r.person.row_id, set())
+        if true_emails:
+            has_truth += 1
         true_domains = {e.split("@", 1)[1] for e in true_emails if "@" in e}
         person_hit = False
         person_domain_hit = False
@@ -117,7 +120,7 @@ def validate(
 
     return ValidationReport(
         total_people=len(results),
-        has_ground_truth=len(truth),
+        has_ground_truth=has_truth,
         overall_hits=overall_hits,
         domain_only_hits=domain_hits,
         by_provider=sorted(metrics.values(), key=lambda x: -x.correct),

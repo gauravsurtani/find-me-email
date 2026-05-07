@@ -17,7 +17,7 @@ class ApifyB2BLeadsProvider(EnrichmentProvider):
     """
 
     name = "apify_b2b_leads"
-    cost_per_call_usd = 0.0015  # ~$1.5 / 1K profiles, only billed on result
+    cost_per_call_usd = 0.0  # Actor is $0 per event (consumes platform compute credits only)
 
     def __init__(self, config: dict | None = None):
         super().__init__(config)
@@ -53,35 +53,80 @@ class ApifyB2BLeadsProvider(EnrichmentProvider):
         return out
 
     def _match_row(self, item: dict[str, Any], url_to_row: dict[str, str]) -> str | None:
-        for k in ("profileUrl", "linkedinUrl", "url", "input"):
+        # b2b_leads echoes the input URL in `url`. harvestapi uses `profileUrl`/`linkedinUrl`.
+        for k in ("url", "profileUrl", "linkedinUrl", "input", "linkedin_url"):
             v = item.get(k)
-            if isinstance(v, str) and v in url_to_row:
-                return url_to_row[v]
+            if isinstance(v, str):
+                # Normalize www. and trailing slash for matching
+                normalized = v.rstrip("/").replace("https://www.", "https://")
+                for url, rid in url_to_row.items():
+                    if normalized.endswith(url.rstrip("/").replace("https://www.", "https://").split("://", 1)[-1]):
+                        return rid
+                if v in url_to_row:
+                    return url_to_row[v]
+        # Last resort: search any string value for any input URL
         for url, rid in url_to_row.items():
-            if any(url in str(v) for v in item.values() if isinstance(v, str)):
-                return rid
+            slug = url.rstrip("/").rsplit("/", 1)[-1]
+            for v in item.values():
+                if isinstance(v, str) and slug in v:
+                    return rid
         return None
 
+    @staticmethod
+    def _confidence_from_str(s: str | None) -> Confidence:
+        return {
+            "high": Confidence.MEDIUM,        # DB match, unverified by us — caller may verify
+            "medium": Confidence.MEDIUM,
+            "low": Confidence.SPECULATIVE,
+            "speculative": Confidence.SPECULATIVE,
+        }.get((s or "").lower(), Confidence.MEDIUM)
+
     def _extract_emails(self, item: dict[str, Any]) -> list[EmailCandidate]:
-        emails: set[str] = set()
+        candidates: list[EmailCandidate] = []
+        seen: set[str] = set()
+
+        # b2b_leads schema: emails is a list of {email, source, confidence, verified_on_platforms}
+        for entry in item.get("emails") or []:
+            if not isinstance(entry, dict):
+                continue
+            email = (entry.get("email") or "").strip().lower()
+            if not email or "@" not in email or email in seen:
+                continue
+            seen.add(email)
+            verified_platforms = entry.get("verified_on_platforms") or []
+            verified = bool(verified_platforms)
+            source = entry.get("source") or "unknown"
+            note = f"b2b_leads via {source}"
+            if verified_platforms:
+                note += f" (verified on {','.join(verified_platforms)})"
+            cand = EmailCandidate(
+                email=email,
+                confidence=self._confidence_from_str(entry.get("confidence")),
+                source_provider=self.name,
+                verified=verified,
+                verification_method=",".join(verified_platforms) if verified_platforms else None,
+                notes=note,
+                raw=entry,
+            )
+            # Promote best_email to top of list
+            if email == (item.get("best_email") or "").strip().lower():
+                candidates.insert(0, cand)
+            else:
+                candidates.append(cand)
+
+        # Fallback: top-level scalar fields (some actors return these)
         for k in ("email", "emailAddress", "workEmail", "personalEmail"):
             v = item.get(k)
-            if isinstance(v, str) and "@" in v:
-                emails.add(v.strip().lower())
-        for k in ("emails", "contactEmails"):
-            v = item.get(k)
-            if isinstance(v, list):
-                for e in v:
-                    if isinstance(e, str) and "@" in e:
-                        emails.add(e.strip().lower())
-        return [
-            EmailCandidate(
-                email=e,
-                confidence=Confidence.MEDIUM,
-                source_provider=self.name,
-                verified=False,
-                notes="Direct DB match from b2b_leads actor",
-                raw=item,
-            )
-            for e in emails
-        ]
+            if isinstance(v, str) and "@" in v and v.strip().lower() not in seen:
+                e = v.strip().lower()
+                seen.add(e)
+                candidates.append(
+                    EmailCandidate(
+                        email=e,
+                        confidence=Confidence.MEDIUM,
+                        source_provider=self.name,
+                        notes=f"top-level {k}",
+                        raw={k: v},
+                    )
+                )
+        return candidates

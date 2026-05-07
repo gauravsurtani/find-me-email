@@ -8,7 +8,7 @@ from typing import Any
 
 import pandas as pd
 
-from find_me_email.college_domains import resolve_domain
+from find_me_email.college_domains import extract_school_from_text, resolve_domain
 from find_me_email.schemas import EmailCandidate, EnrichmentResult, Person
 
 # Column header aliases (case-insensitive, stripped of non-alphanumerics).
@@ -102,6 +102,18 @@ def read_people(path: Path, sample: int | None = None, seed: int = 42) -> list[P
             if pd.isna(val) or val == "":
                 continue
             kwargs[field] = str(val).strip()
+
+        # If the source CSV has no `school` column, try inferring from headline/title/location/name.
+        if not kwargs.get("school"):
+            inferred = extract_school_from_text(
+                kwargs.get("title"),
+                kwargs.get("location"),
+                kwargs.get("name"),
+                kwargs.get("first_name"),
+                kwargs.get("last_name"),
+            )
+            if inferred:
+                kwargs["school"] = inferred
 
         if kwargs.get("school") and not kwargs.get("school_domain"):
             dom = resolve_domain(kwargs["school"])
