@@ -36,6 +36,7 @@ class ApifyB2BLeadsProvider(EnrichmentProvider):
             return {p.row_id: [] for p in people}
 
         url_to_row: dict[str, str] = {str(p.linkedin_url): p.row_id for p in targets}
+        row_to_person: dict[str, Person] = {p.row_id: p for p in targets}
         payload = {"profileUrls": list(url_to_row.keys())}
 
         async with ApifyClient() as ac:
@@ -46,6 +47,12 @@ class ApifyB2BLeadsProvider(EnrichmentProvider):
             row_id = self._match_row(item, url_to_row)
             if not row_id:
                 continue
+            # Side effect: enrich the Person with school context discovered in the
+            # actor's profile response. Lets downstream pattern_guess fire even when
+            # the source CSV had no school column.
+            person = row_to_person.get(row_id)
+            if person is not None:
+                self._enrich_person_from_item(item, person)
             for cand in self._extract_emails(item):
                 cand.source_provider = self.name
                 cand.cost_usd = self.cost_per_call_usd
@@ -71,6 +78,49 @@ class ApifyB2BLeadsProvider(EnrichmentProvider):
                 if isinstance(v, str) and slug in v:
                     return rid
         return None
+
+    @staticmethod
+    def _enrich_person_from_item(item: dict[str, Any], person: Person) -> None:
+        """Populate person.school / school_domain from the actor's profile response.
+
+        Looks at the structured `educations` field first (most reliable). Skips
+        masked/redacted entries (harvestapi sometimes returns asterisks for
+        unverified/private fields). If multiple schools, picks the most recent
+        one with a non-masked name.
+        """
+        if person.school and person.school_domain:
+            return
+        from find_me_email.college_domains import resolve_domain
+
+        edus = item.get("educations") or item.get("education") or []
+        if isinstance(edus, dict):
+            edus = [edus]
+
+        # Prefer entries with the most recent end_date (or no end_date = current student)
+        def _sort_key(e: dict) -> tuple:
+            end = (e.get("end_date") or "9999")[:7]  # current first
+            start = (e.get("start_date") or "0000")[:7]
+            return (end, start)
+
+        sortable = [e for e in edus if isinstance(e, dict)]
+        sortable.sort(key=_sort_key, reverse=True)
+
+        for edu in sortable:
+            sch = (edu.get("school") or edu.get("schoolName") or "").strip()
+            if not sch or "*" in sch:  # masked/redacted
+                continue
+            person.school = person.school or sch
+            if not person.school_domain:
+                person.school_domain = resolve_domain(sch)
+            return
+
+        # Fallback: if no education info, try the headline
+        if not person.school:
+            from find_me_email.college_domains import extract_school_from_text
+            inferred = extract_school_from_text(item.get("headline"), item.get("about"))
+            if inferred:
+                person.school = inferred
+                person.school_domain = resolve_domain(inferred)
 
     @staticmethod
     def _confidence_from_str(s: str | None) -> Confidence:

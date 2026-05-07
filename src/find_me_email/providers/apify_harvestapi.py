@@ -42,6 +42,7 @@ class ApifyHarvestAPIProvider(EnrichmentProvider):
             return {p.row_id: [] for p in people}
 
         url_to_row: dict[str, str] = {str(p.linkedin_url): p.row_id for p in targets}
+        row_to_person: dict[str, Person] = {p.row_id: p for p in targets}
         payload = {
             "profileScraperMode": self.mode,
             "queries": list(url_to_row.keys()),
@@ -56,6 +57,10 @@ class ApifyHarvestAPIProvider(EnrichmentProvider):
             row_id = helper._match_row(item, url_to_row)  # noqa: SLF001
             if not row_id:
                 continue
+            # Side effect: enrich Person with discovered school so pattern_guess fires
+            person = row_to_person.get(row_id)
+            if person is not None:
+                helper._enrich_person_from_item(item, person)  # noqa: SLF001
             for cand in helper._extract_emails(item):  # noqa: SLF001
                 cand.source_provider = self.name
                 cand.confidence = Confidence.HIGH if item.get("emailVerified") else Confidence.MEDIUM
