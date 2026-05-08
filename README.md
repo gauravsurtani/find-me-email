@@ -1,13 +1,50 @@
 # find-emails
 
-Single-file Python module that takes a list of LinkedIn profile URLs and
-returns emails. Wraps Apify's `harvestapi/linkedin-profile-scraper` actor —
-the one that actually works.
+Find emails for LinkedIn profile URLs. Standalone tool that drops into any
+Python project — and an add-on layer for plugging the same logic into a larger
+application (e.g. a candidate drawer, outreach tool, CRM enrichment).
+
+## What's in here
+
+```
+                       PURPOSE                          USAGE PATTERN
+─────────────────────────────────────────────────────────────────────────────
+  find_emails.py       Standalone Apify lookup          Batch CSV / scripts /
+                       (cheap, ~50% hit rate,           notebooks / CLI
+                        ~$10 per 1000 profiles)
+
+  find_emails_         Standalone SignalHire lookup     Same — works alone
+  signalhire.py        (richer data + personal email
+                        + phone numbers, ~$0.06/lookup)
+
+  reveal.py    ◀────── ADD-ON: thin orchestrator        Drop into a larger
+                       Single function, source-list      app where reveals
+                       parameter. Default: Apify only.   happen on user click
+
+  scripts/             Standalone harness for adding
+   actor_bakeoff.py    a new Apify actor — score it
+                       against ground truth before
+                       wiring it in
+```
+
+The two `find_emails*.py` files are independent — each works on its own.
+`reveal.py` is a 100-line wrapper that calls them in caller-controlled order,
+designed for "reveal one email per user click" use cases.
+
+## Setup
+
+```bash
+pip install httpx pandas python-dotenv
+export APIFY_TOKEN=apify_api_xxx           # for find_emails.py
+export SIGNALHIRE_API_KEY=...              # for find_emails_signalhire.py
+```
+
+Or `pip install -e .` from this repo to expose the `find-emails` CLI.
+
+## Standalone use — cheap baseline (Apify)
 
 ```python
-from find_emails import find_email, find_emails
-
-email = find_email("https://linkedin.com/in/satyanadella")
+from find_emails import find_emails
 
 df = find_emails([
     "https://linkedin.com/in/satyanadella",
@@ -17,61 +54,136 @@ df = find_emails([
 #          name, headline, company, raw
 ```
 
-## Drop into another project
-
-Just copy [`find_emails.py`](find_emails.py) — it's one self-contained file.
-
+CLI:
 ```bash
-pip install httpx pandas python-dotenv
-export APIFY_TOKEN=apify_api_xxx        # get one at apify.com (FREE plan works)
+find-emails people.csv --url-column linkedin_url --output emails.csv
 ```
 
-Or `pip install -e .` from this repo to expose the `find-emails` CLI.
+## Standalone use — premium (SignalHire)
 
-## CLI
+```python
+from find_emails_signalhire import find_emails
 
-```bash
-python find_emails.py people.csv \
-    --url-column linkedin_url \
-    --output emails.csv
+df = find_emails([
+    "https://linkedin.com/in/lvblack",
+])
+# columns: linkedin_url, email, all_emails, email_status, email_quality,
+#          name, headline, company, phones, raw
+# SignalHire returns full profile + multiple emails (subType: personal/work)
+# + phone numbers as a bonus.
 ```
 
-The output CSV has the email columns appended; original columns are preserved.
+## Add-on use — `reveal.py` for plugging into a larger app
 
-## How it works
+Use this when:
 
-| Step | Detail |
-|-|-|
-| 1 | Splits input URLs into chunks of 50 (configurable) |
-| 2 | Launches up to 5 Apify actor runs in parallel (configurable, max 25) |
-| 3 | Polls each run until SUCCEEDED, then pulls the dataset |
-| 4 | Matches results back to inputs by LinkedIn slug (`/in/<slug>`) — robust to `www.` prefix differences |
-| 5 | Returns one row per input URL, ordered as input |
+- You're integrating the email-find logic into a recruiting / outreach / CRM
+  product
+- Calls happen on-demand (per user click), not batch
+- You want one uniform return shape regardless of which provider answered
+- You want the caller to control which source(s) to try, and in what order
 
-Emails inside each result are ranked: `status=valid` first, then by `qualityScore`. The `email` column is the top pick; `all_emails` has all candidates.
+```python
+from reveal import reveal_email
 
-## Cost & performance
+# Default — Apify only (~$0.01)
+result = reveal_email("https://linkedin.com/in/lvblack")
+# RevealResult(email="...", source="apify_harvestapi", cost_usd=0.01, ...)
 
-| Metric | Value |
-|-|-|
-| Price | **$10 per 1000 LinkedIn URLs** (harvestapi pay-per-result) |
-| Hit rate, working professionals | ~70% |
-| Hit rate, students | ~50% |
-| Throughput | ~250s per 50-URL chunk; ~30s per 5-URL chunk |
-| Failed lookups | not billed |
+# Escalation — caller decides when. e.g. user marked Apify result as wrong
+result = reveal_email("https://linkedin.com/in/lvblack",
+                      sources=["signalhire"])
 
-`status='valid'` means the mailbox is SMTP-deliverable. `status='risky'` typically means a catch-all domain (mailbox unconfirmed but the domain accepts mail).
+# Full cascade (rare; usually let users trigger escalation per-click)
+result = reveal_email("https://linkedin.com/in/lvblack",
+                      sources=["apify_harvestapi", "signalhire"])
+
+# Result shape (uniform across providers):
+#   result.email       - best email or None
+#   result.alt_email   - second-best email if any
+#   result.phones      - list of phones (SignalHire bonus)
+#   result.source      - "apify_harvestapi" | "signalhire" | "none"
+#   result.cost_usd    - what this call cost
+#   result.status      - "valid" / "risky" / "personal" / "work"
+#   result.all_emails  - everything the provider returned
+#   result.profile     - {name, headline, company} for context
+#   result.found       - True if email is non-empty
+```
+
+### Drawer / CRM integration sketch
+
+```python
+# Your app's reveal endpoint:
+def reveal_for_drawer(person, user):
+    # Already have an email and it's not flagged wrong → return cached
+    if person.email_1 and not person.email_marked_incorrect:
+        return person.email_1
+
+    # Either first reveal, or user marked previous email as wrong.
+    # Default = Apify; escalate to SignalHire only after a flag.
+    sources = (["signalhire"] if person.email_marked_incorrect
+               else ["apify_harvestapi"])
+
+    result = reveal_email(person.linkedin_url, sources=sources)
+
+    if result.found:
+        if person.email_marked_incorrect:
+            person.email_2 = result.email           # alternate
+            person.email_2_source = result.source
+        else:
+            person.email_1 = result.email           # primary
+            person.email_source = result.source
+        save(person)
+        log_audit(user, person, result)
+    return result
+```
+
+That's the entire integration. Cost stays predictable: $0.01 per first reveal,
+$0.06 only when a user explicitly flags the previous result as wrong.
 
 ## What this replaced
 
-This started as a 6-pass cascade through 6 different actors plus a verifier. After running on 2127 students:
+```
+                          BEFORE                           AFTER
+──────────────────────────────────────────────────────────────────────────
+  6-pass cascade with verifier      0% best-pick correct    47% (single
+                                    on 2127 students,       harvestapi pass
+                                    ~$30 wasted             at ~$10) +
+                                                            on-demand
+                                                            SignalHire for
+                                                            specific reveals
+```
 
-| Approach | Hit rate | Cost | Notes |
-|-|-|-|-|
-| 6-pass cascade | 0% best-pick correct | ~$30+ | wrong-person noise; school directory pages dumped 2000+ emails per row |
-| **harvestapi alone** | **47% with email, ~56% useful** | **$10** | clean, real LinkedIn DB results |
+The legacy cascade is gone. See commit `ab411ce` for the deletion.
+The bake-off that picked harvestapi out of 5 candidates lives at
+`scripts/actor_bakeoff.py` — useful when you ever want to compare new actors.
 
-The cascade has been deleted; everything you need is in `find_emails.py`. See `scripts/actor_bakeoff.py` for the standalone harness used to compare actors.
+## Cost / accuracy notes
+
+| | Apify harvestapi | SignalHire |
+|-|-|-|
+| Cost | $10 / 1000 profiles (pay-per-result) | $57 / 1000 credits ≈ $0.06/lookup |
+| Hit rate (working pros) | ~70% | ~80% |
+| Hit rate (students) | ~50% | ~80% |
+| Returns personal email subType | partial | yes (explicit flag) |
+| Returns phone numbers | no | yes (bonus on personal-email tier) |
+| Returns full LinkedIn profile | yes | yes (skills, education, experience) |
+| Verified flag | partial (`email_status`) | rating 0-100 + status |
+
+Empirical scorecard from a 5-row stress test (2 covered earlier in commit
+history; harvestapi vs SignalHire vs Apollo):
+
+| Person | Truth | harvestapi | SignalHire | Apollo |
+|-|-|-|-|-|
+| Lucy Black | lvblack@stanford.edu | ❌ | ✅ exact | ❌ extrapolated guess |
+| Naomi Wong | nwongg@berkeley.edu | ✅ | ✅ exact + alt | ✅ verified |
+| Anu Kirk | anu.kirk@gmail.com | ❌ | ✅ exact + 4 phones | ✅ in personal_emails[] |
+| Salina Jiang | salina.jiang@alphasights.com | ❌ | ⚠ schwab.com | ⚠ null (truth stale) |
+| Ke Xu | kx@daicus.com | ❌ | ✅ exact + alt gmail | ⚠ TrusOne (newer role) |
+
+**Net:** harvestapi 1/5, SignalHire 4/5, Apollo 2/5. SignalHire is the right
+default for "find personal email." Apollo not currently wired (would be
+trivial to add as a third source — same pattern).
 
 ## License
 
