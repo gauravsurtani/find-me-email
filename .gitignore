@@ -25,8 +25,9 @@ venv/
 build/
 dist/
 
-# IDE
+# IDE / agent state
 .vscode/
 .idea/
+.claude/
 *.swp
 .DS_Store
