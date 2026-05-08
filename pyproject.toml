@@ -17,4 +17,4 @@ requires = ["setuptools>=68"]
 build-backend = "setuptools.build_meta"
 
 [tool.setuptools]
-py-modules = ["find_emails"]
+py-modules = ["find_emails", "find_emails_signalhire", "reveal"]
